@@ -3,9 +3,9 @@ import os
 import pickle
 import base64
 import numpy as np
+import math
 from datetime import datetime, timedelta
 from collections import defaultdict
-import math
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
@@ -30,7 +30,7 @@ MODEL_FEATURE_NAMES = {
     'fuerza_relativa':['roc5','roc10','roc20','vs50'],
 }
 
-MIN_MOVE_PCT = {7: 0.3, 14: 0.5, 30: 0.8, 60: 1.2, 90: 1.5}
+MIN_MOVE_PCT  = {7: 0.3, 14: 0.5, 30: 0.8, 60: 1.2, 90: 1.5}
 HORIZON_BUCKETS = [7, 14, 30, 60, 90]
 
 
@@ -42,159 +42,138 @@ def cl3(v, lo=-3.0, hi=3.0):
     return max(lo, min(hi, float(v or 0)))
 
 
-# ── Indicator helpers ────────────────────────────────────────────────────────
+# ── Vectorized feature computation (pandas, per asset) ───────────────────────
 
-def _ema(prices, period):
-    k = 2.0 / (period + 1)
-    val = float(prices[0])
-    for p in prices[1:]:
-        val = float(p) * k + val * (1 - k)
-    return val
+def compute_all_features_for_asset(rows):
+    """
+    Returns {date_str: feature_dict} for all dates with enough history.
+    Uses pandas rolling windows — O(n) per feature, no per-row slicing.
+    """
+    import pandas as pd
 
+    if len(rows) < 21:
+        return {}
 
-def _rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50.0
-    deltas = np.diff(closes[-(period + 1):])
-    avg_gain = np.maximum(deltas, 0).mean()
-    avg_loss = np.maximum(-deltas, 0).mean()
-    if avg_loss < 1e-10:
-        return 100.0
-    return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    dates = [r['trade_date'] for r in rows]
 
+    c = pd.Series(
+        [float(r.get('adj_close') or r.get('close') or 0) for r in rows]
+    ).replace(0, float('nan')).ffill().bfill()
 
-def compute_features_from_ohlcv(rows, trade_date):
-    """Compute all model features from raw OHLCV rows (oldest→newest)."""
-    n = len(rows)
-    if n < 21:
-        return None
+    h = pd.Series([float(r.get('high')   or 0) for r in rows]).where(lambda s: s > 0, c)
+    l = pd.Series([float(r.get('low')    or 0) for r in rows]).where(lambda s: s > 0, c)
+    o = pd.Series([float(r.get('open')   or 0) for r in rows]).where(lambda s: s > 0, c)
+    v = pd.Series([float(r.get('volume') or 0) for r in rows])
 
-    closes  = np.array([float(r.get('adj_close') or r.get('close') or 0) for r in rows], dtype=np.float64)
-    highs   = np.array([float(r.get('high') or closes[i]) for i, r in enumerate(rows)], dtype=np.float64)
-    lows    = np.array([float(r.get('low') or closes[i]) for i, r in enumerate(rows)], dtype=np.float64)
-    opens   = np.array([float(r.get('open') or closes[i]) for i, r in enumerate(rows)], dtype=np.float64)
-    volumes = np.array([float(r.get('volume') or 0) for r in rows], dtype=np.float64)
+    # ── SMA ratios ────────────────────────────────────────────────────────────
+    sma20  = c.rolling(20,  min_periods=5).mean()
+    sma50  = c.rolling(50,  min_periods=20).mean()
+    sma200 = c.rolling(200, min_periods=50).mean()
 
-    close = closes[-1]
-    if close <= 0:
-        return None
+    vs20  = ((c - sma20)  / sma20  * 100).clip(-20, 20) / 20
+    vs50  = ((c - sma50)  / sma50  * 100).clip(-20, 20) / 20
+    vs200 = ((c - sma200) / sma200 * 100).clip(-30, 30) / 30
 
-    # SMA ratios
-    sma20  = closes[-min(20, n):].mean()
-    sma50  = closes[-min(50, n):].mean()
-    sma200 = closes[-min(200, n):].mean()
-    vs20  = cl((close - sma20)  / sma20  * 100 if sma20  > 0 else 0, 20)
-    vs50  = cl((close - sma50)  / sma50  * 100 if sma50  > 0 else 0, 20)
-    vs200 = cl((close - sma200) / sma200 * 100 if sma200 > 0 else 0, 30)
+    # ── RSI ───────────────────────────────────────────────────────────────────
+    delta = c.diff()
+    gain  = delta.clip(lower=0).rolling(14, min_periods=5).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14, min_periods=5).mean()
+    rsi   = (100 - 100 / (1 + gain / loss.replace(0, 1e-10))).fillna(50)
+    rsi_norm = (rsi - 50) / 25.0
 
-    # RSI
-    rsi_norm = (_rsi(closes) - 50) / 25.0
+    # ── ROC ───────────────────────────────────────────────────────────────────
+    roc5  = (c.pct_change(5)  * 100).clip(-20, 20) / 20
+    roc10 = (c.pct_change(10) * 100).clip(-30, 30) / 30
+    roc20 = (c.pct_change(20) * 100).clip(-40, 40) / 40
 
-    # ROC
-    roc5  = cl((close / closes[-6]  - 1) * 100 if n >= 6  and closes[-6]  > 0 else 0, 20)
-    roc10 = cl((close / closes[-11] - 1) * 100 if n >= 11 and closes[-11] > 0 else 0, 30)
-    roc20 = cl((close / closes[-21] - 1) * 100 if n >= 21 and closes[-21] > 0 else 0, 40)
+    # ── MACD (EMA12 − EMA26) ─────────────────────────────────────────────────
+    ema12     = c.ewm(span=12, adjust=False).mean()
+    ema26     = c.ewm(span=26, adjust=False).mean()
+    macd_h    = ema12 - ema26
+    macd_norm = (macd_h / (macd_h.abs() + 0.01)).clip(-3, 3) * 0.33
 
-    # MACD (EMA12 - EMA26)
-    ema_window = closes[-min(52, n):]
-    ema12 = _ema(ema_window, 12)
-    ema26 = _ema(ema_window, 26) if len(ema_window) >= 26 else _ema(ema_window, len(ema_window))
-    macd_h = ema12 - ema26
-    macd_norm = cl3(macd_h / (abs(macd_h) + 0.01)) * 0.33
+    # ── Bollinger Bands ───────────────────────────────────────────────────────
+    std20    = c.rolling(20, min_periods=5).std()
+    bb_range = (2 * std20 * 2).replace(0, float('nan'))
+    bb_pct_b = ((c - (sma20 - 2 * std20)) / bb_range).clip(0, 1).fillna(0.5)
+    bb_pos   = bb_pct_b * 2 - 1
+    avg_std  = std20.rolling(20, min_periods=10).mean()
+    bb_squeeze = ((std20 < 0.75 * avg_std) & avg_std.notna()).astype(float)
 
-    # Bollinger Bands (20-day, 2σ)
-    w = min(20, n)
-    std20 = closes[-w:].std() if w >= 2 else 0.0
-    upper = sma20 + 2 * std20
-    lower = sma20 - 2 * std20
-    rng = upper - lower
-    bb_pct_b = (close - lower) / rng if rng > 1e-10 else 0.5
-    bb_pos = bb_pct_b * 2 - 1
-    if n >= 40:
-        avg_std = np.array([closes[-40 + i: -40 + i + 20].std() for i in range(20)]).mean()
-        bb_squeeze = 1.0 if std20 < 0.75 * avg_std and avg_std > 0 else 0.0
-    else:
-        bb_squeeze = 0.0
+    # ── ATR ───────────────────────────────────────────────────────────────────
+    prev_c = c.shift(1)
+    tr     = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    atr    = tr.rolling(14, min_periods=5).mean()
+    atr_norm = (atr / c * 100).clip(0, 5) / 5
 
-    # ATR (14-day)
-    w14 = min(14, n - 1)
-    if w14 > 0:
-        tr = np.maximum(
-            highs[-w14:] - lows[-w14:],
-            np.maximum(
-                np.abs(highs[-w14:] - closes[-w14 - 1:-1]),
-                np.abs(lows[-w14:]  - closes[-w14 - 1:-1])
-            )
-        )
-        atr_pct = tr.mean() / close * 100
-    else:
-        atr_pct = 1.0
-    atr_norm = cl(atr_pct, 5)
+    # ── Historical Volatility ─────────────────────────────────────────────────
+    log_ret = np.log(c / c.shift(1))
+    hv      = log_ret.rolling(20, min_periods=10).std() * math.sqrt(252) * 100
+    hv_norm = hv.clip(0, 100) / 100
 
-    # Historical volatility (20-day annualised)
-    w20 = min(21, n)
-    hv = closes[-w20:].std() / close * math.sqrt(252) * 100 if w20 >= 2 else 20.0
-    hv_norm = cl(hv, 100)
+    # ── OBV direction (5-day) ─────────────────────────────────────────────────
+    obv_dir = np.sign((v * np.sign(delta).fillna(0)).rolling(5, min_periods=1).sum()).fillna(0)
 
-    # OBV direction (5-day)
-    obv = 0.0
-    for i in range(max(-5, -n + 1), 0):
-        if closes[i] > closes[i - 1]:
-            obv += volumes[i]
-        elif closes[i] < closes[i - 1]:
-            obv -= volumes[i]
-    obv_dir = 1.0 if obv > 0 else (-1.0 if obv < 0 else 0.0)
+    # ── Candle ───────────────────────────────────────────────────────────────
+    candle = np.sign(c - o).replace(0, -1).fillna(-1)
 
-    # Candle direction
-    candle = 1.0 if closes[-1] > opens[-1] else -1.0
+    # ── ADX (simplified 14-day) ───────────────────────────────────────────────
+    pdm   = (h - h.shift(1)).clip(lower=0)
+    mdm   = (l.shift(1) - l).clip(lower=0)
+    atr14 = tr.rolling(14, min_periods=5).mean().replace(0, float('nan'))
+    pdi   = (100 * pdm.rolling(14, min_periods=5).mean() / atr14).fillna(0)
+    mdi   = (100 * mdm.rolling(14, min_periods=5).mean() / atr14).fillna(0)
+    dx    = (100 * (pdi - mdi).abs() / (pdi + mdi + 1e-10)).clip(0, 100)
+    adx_norm = (dx.clip(0, 50) / 50 - 0.4).fillna(-0.4)
 
-    # ADX (simplified 14-day)
-    if n >= 15:
-        h14 = highs[-15:]
-        l14 = lows[-15:]
-        c14 = closes[-15:]
-        pdm = np.maximum(np.diff(h14), 0)
-        mdm = np.maximum(-np.diff(l14), 0)
-        tr14 = np.maximum(
-            h14[1:] - l14[1:],
-            np.maximum(np.abs(h14[1:] - c14[:-1]), np.abs(l14[1:] - c14[:-1]))
-        )
-        atr14 = tr14.mean()
-        if atr14 > 0:
-            pdi = 100 * pdm.mean() / atr14
-            mdi = 100 * mdm.mean() / atr14
-            adx_val = 100 * abs(pdi - mdi) / (pdi + mdi + 1e-10)
-        else:
-            adx_val = 20.0
-        adx_norm = cl(adx_val, 50) - 0.4
-    else:
-        adx_norm = -0.4
-    adx_dir = adx_norm
+    # ── Seasonality ───────────────────────────────────────────────────────────
+    months    = [datetime.strptime(d, '%Y-%m-%d').month if d else 6 for d in dates]
+    sin_month = pd.Series([math.sin(2 * math.pi * m / 12) for m in months])
+    cos_month = pd.Series([math.cos(2 * math.pi * m / 12) for m in months])
 
-    # Seasonality
-    try:
-        month = datetime.strptime(trade_date, '%Y-%m-%d').month
-    except Exception:
-        month = 6
-    sin_month = math.sin(2 * math.pi * month / 12)
-    cos_month = math.cos(2 * math.pi * month / 12)
+    def _f(series, i, default=0.0):
+        v = series.iloc[i]
+        return float(v) if v == v else default  # NaN check
 
-    return {
-        'vs20': vs20, 'vs50': vs50, 'vs200': vs200,
-        'rsi_norm': rsi_norm, 'macd_norm': macd_norm,
-        'bb_pos': bb_pos, 'bb_squeeze': bb_squeeze,
-        'atr_norm': atr_norm, 'hv_norm': hv_norm,
-        'obv_dir': obv_dir,
-        'roc5': roc5, 'roc10': roc10, 'roc20': roc20,
-        'candle': candle,
-        'adx_norm': adx_norm, 'adx_dir': adx_dir,
-        'neg_vs20': -vs20, 'neg_bb': -bb_pos,
-        'neg_rsi': -rsi_norm, 'neg_vs50': -vs50,
-        'sin_month': sin_month, 'cos_month': cos_month,
-    }
+    result = {}
+    for i in range(21, len(rows)):
+        close_val = c.iloc[i]
+        if close_val != close_val or close_val <= 0:
+            continue
+        vs20_v  = _f(vs20, i)
+        vs50_v  = _f(vs50, i)
+        bb_pos_v = _f(bb_pos, i)
+        rsi_v   = _f(rsi_norm, i)
+        feat = {
+            'vs20':       vs20_v,
+            'vs50':       vs50_v,
+            'vs200':      _f(vs200, i),
+            'rsi_norm':   rsi_v,
+            'macd_norm':  _f(macd_norm, i),
+            'bb_pos':     bb_pos_v,
+            'bb_squeeze': _f(bb_squeeze, i),
+            'atr_norm':   _f(atr_norm, i, 0.2),
+            'hv_norm':    _f(hv_norm, i, 0.2),
+            'obv_dir':    _f(obv_dir, i),
+            'roc5':       _f(roc5, i),
+            'roc10':      _f(roc10, i),
+            'roc20':      _f(roc20, i),
+            'candle':     _f(candle, i, -1.0),
+            'adx_norm':   _f(adx_norm, i, -0.4),
+            'adx_dir':    _f(adx_norm, i, -0.4),
+            'neg_vs20':   -vs20_v,
+            'neg_bb':     -bb_pos_v,
+            'neg_rsi':    -rsi_v,
+            'neg_vs50':   -vs50_v,
+            'sin_month':  float(sin_month.iloc[i]),
+            'cos_month':  float(cos_month.iloc[i]),
+        }
+        result[dates[i]] = feat
+
+    return result
 
 
-# ── Extract features from indicators row (for daily prediction) ──────────────
+# ── Extract features from indicators row (daily prediction) ──────────────────
 
 def extract_features(ind):
     vs20  = cl(ind.get('price_vs_sma20', 0), 20)
@@ -209,24 +188,21 @@ def extract_features(ind):
     macd_h = float(macd_h)
     macd_norm = cl3(macd_h / (abs(macd_h) + 0.01)) * 0.33
 
-    bb_b   = float(ind.get('bb_pct_b', 0.5) or 0.5)
-    bb_pos = bb_b * 2 - 1
+    bb_b      = float(ind.get('bb_pct_b', 0.5) or 0.5)
+    bb_pos    = bb_b * 2 - 1
     bb_squeeze = 1.0 if ind.get('bb_squeeze') else 0.0
+    atr_norm  = cl(ind.get('atr_pct', 1), 5)
+    hv_norm   = cl(ind.get('hist_vol_20', 20), 100)
 
-    atr_norm = cl(ind.get('atr_pct', 1), 5)
-    hv_norm  = cl(ind.get('hist_vol_20', 20), 100)
-
-    obv_t = ind.get('obv_trend', '')
+    obv_t   = ind.get('obv_trend', '')
     obv_dir = 1.0 if obv_t == 'rising' else (-1.0 if obv_t == 'falling' else 0.0)
 
     roc5  = cl(ind.get('roc_5', 0), 20)
     roc10 = cl(ind.get('roc_10', 0), 30)
     roc20 = cl(ind.get('roc_20', 0), 40)
 
-    candle = 1.0 if ind.get('candle_signal') == 'bullish' else -1.0
-
+    candle   = 1.0 if ind.get('candle_signal') == 'bullish' else -1.0
     adx_norm = cl(ind.get('adx_14', 20), 50) - 0.4
-    adx_dir  = adx_norm
 
     dt_str = ind.get('computed_date', '')
     try:
@@ -244,14 +220,14 @@ def extract_features(ind):
         'obv_dir': obv_dir,
         'roc5': roc5, 'roc10': roc10, 'roc20': roc20,
         'candle': candle,
-        'adx_norm': adx_norm, 'adx_dir': adx_dir,
+        'adx_norm': adx_norm, 'adx_dir': adx_norm,
         'neg_vs20': -vs20, 'neg_bb': -bb_pos,
         'neg_rsi': -rsi_norm, 'neg_vs50': -vs50,
         'sin_month': sin_month, 'cos_month': cos_month,
     }
 
 
-# ── Training (uses price_history) ────────────────────────────────────────────
+# ── Training ─────────────────────────────────────────────────────────────────
 
 def train_model(model_name: str) -> dict:
     from supabase import create_client
@@ -263,8 +239,8 @@ def train_model(model_name: str) -> dict:
     feature_names = MODEL_FEATURE_NAMES[model_name]
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # Fetch all price history
-    all_rows = []
+    # Fetch all price history (paginated)
+    all_rows: list = []
     offset = 0
     while True:
         resp = sb.table('price_history').select(
@@ -279,32 +255,25 @@ def train_model(model_name: str) -> dict:
     if not all_rows:
         raise ValueError('No price history data found')
 
-    # Group by asset_id, sorted by date
+    # Group and sort by asset
     asset_rows: dict = defaultdict(list)
     for row in all_rows:
         asset_rows[row['asset_id']].append(row)
     for aid in asset_rows:
         asset_rows[aid].sort(key=lambda r: r['trade_date'])
 
-    # Compute features for every (asset, date) with enough history
-    feat_cache: dict = {}       # (asset_id, trade_date) -> feature dict
-    price_cache: dict = {}      # (asset_id, trade_date) -> close price
+    # Vectorized feature computation — one pandas pass per asset
+    feat_cache: dict  = {}   # (aid, date) -> feature dict
+    price_cache: dict = {}   # (aid, date) -> close price
 
     for aid, rows in asset_rows.items():
-        date_to_close = {
-            r['trade_date']: float(r.get('adj_close') or r.get('close') or 0)
-            for r in rows
-        }
-        for i in range(21, len(rows)):
-            date_str = rows[i]['trade_date']
-            close_p  = date_to_close.get(date_str, 0)
-            if close_p <= 0:
-                continue
-            feats = compute_features_from_ohlcv(rows[:i + 1], date_str)
-            if feats is None:
-                continue
-            feat_cache[(aid, date_str)]  = feats
-            price_cache[(aid, date_str)] = close_p
+        feats_by_date = compute_all_features_for_asset(rows)
+        for date_str, feats in feats_by_date.items():
+            feat_cache[(aid, date_str)] = feats
+        for r in rows:
+            close_p = float(r.get('adj_close') or r.get('close') or 0)
+            if close_p > 0:
+                price_cache[(aid, r['trade_date'])] = close_p
 
     bucket_results = {}
     for bucket in HORIZON_BUCKETS:
@@ -312,37 +281,34 @@ def train_model(model_name: str) -> dict:
         X_rows, y_rows = [], []
 
         for aid, rows in asset_rows.items():
-            date_to_close = {
-                r['trade_date']: float(r.get('adj_close') or r.get('close') or 0)
-                for r in rows
-            }
+            d2c   = {r['trade_date']: price_cache.get((aid, r['trade_date']), 0) for r in rows}
             dates = [r['trade_date'] for r in rows]
 
-            for i in range(21, len(rows)):
-                date_str = dates[i]
+            for date_str in dates[21:]:
                 feats = feat_cache.get((aid, date_str))
                 if feats is None:
                     continue
-                close_p = price_cache[(aid, date_str)]
+                close_p = price_cache.get((aid, date_str), 0)
+                if close_p <= 0:
+                    continue
 
-                # Forward price
                 try:
-                    target_dt = datetime.strptime(date_str, '%Y-%m-%d') + timedelta(days=int(bucket * 1.45))
+                    target = datetime.strptime(date_str, '%Y-%m-%d') + timedelta(days=int(bucket * 1.45))
                 except Exception:
                     continue
 
-                future_price = None
+                future = None
                 for delta in range(-3, 8):
-                    check = (target_dt + timedelta(days=delta)).strftime('%Y-%m-%d')
-                    fp = date_to_close.get(check, 0)
+                    check = (target + timedelta(days=delta)).strftime('%Y-%m-%d')
+                    fp = d2c.get(check, 0)
                     if fp > 0:
-                        future_price = fp
+                        future = fp
                         break
 
-                if future_price is None:
+                if future is None:
                     continue
 
-                pct = (future_price - close_p) / close_p * 100
+                pct = (future - close_p) / close_p * 100
                 X_rows.append([feats.get(f, 0.0) for f in feature_names])
                 y_rows.append(1 if pct >= min_move else 0)
 
@@ -369,16 +335,16 @@ def train_model(model_name: str) -> dict:
         )
         model.fit(X, y)
 
-        train_acc = float((model.predict(X) == y).mean())
-        model_b64 = base64.b64encode(pickle.dumps(model)).decode()
+        train_acc  = float((model.predict(X) == y).mean())
+        model_b64  = base64.b64encode(pickle.dumps(model)).decode()
 
         sb.table('xgb_models').upsert({
-            'model_name':    model_name,
+            'model_name':     model_name,
             'horizon_bucket': bucket,
-            'model_data':    model_b64,
-            'feature_names': feature_names,
+            'model_data':     model_b64,
+            'feature_names':  feature_names,
             'train_accuracy': train_acc,
-            'train_samples': len(X_rows),
+            'train_samples':  len(X_rows),
         }, on_conflict='model_name,horizon_bucket').execute()
 
         bucket_results[bucket] = {
@@ -390,7 +356,7 @@ def train_model(model_name: str) -> dict:
     return {'model_name': model_name, 'buckets': bucket_results}
 
 
-# ── Prediction (uses indicators table) ──────────────────────────────────────
+# ── Prediction ────────────────────────────────────────────────────────────────
 
 def run_predictions() -> dict:
     from supabase import create_client
@@ -417,11 +383,11 @@ def run_predictions() -> dict:
         'atr_pct,hist_vol_20,obv_trend,roc_5,roc_10,roc_20,'
         'candle_signal,adx_14,assets(ticker,is_active)'
     )
-    today = datetime.now().strftime('%Y-%m-%d')
+    today     = datetime.now().strftime('%Y-%m-%d')
     indicators = sb.table('indicators').select(cols).eq('computed_date', today).execute().data or []
 
     if not indicators:
-        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        yesterday  = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         indicators = sb.table('indicators').select(cols).eq('computed_date', yesterday).execute().data or []
 
     if not indicators:
@@ -440,7 +406,7 @@ def run_predictions() -> dict:
 
         for (model_name, bucket), model_info in models.items():
             feature_names = model_info['feature_names']
-            model = model_info['model']
+            model         = model_info['model']
             x = np.array([[feats_all.get(f, 0.0) for f in feature_names]], dtype=np.float32)
             prob_up = float(model.predict_proba(x)[0][1])
 
@@ -467,7 +433,7 @@ def run_predictions() -> dict:
     }
 
 
-# ── Flask app ────────────────────────────────────────────────────────────────
+# ── Flask app ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 
@@ -491,7 +457,7 @@ def train():
         return '', 200
     if not _check_secret():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
-    body = request.get_json(silent=True) or {}
+    body       = request.get_json(silent=True) or {}
     model_name = body.get('model_name', 'tendencia')
     try:
         result = train_model(model_name)

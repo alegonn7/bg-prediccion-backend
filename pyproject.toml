@@ -8,6 +8,7 @@ dependencies = [
     "supabase==2.10.0",
     "flask==3.1.0",
     "gunicorn==23.0.0",
+    "pandas==2.2.3",
 ]
 
 [tool.vercel]
