@@ -1,0 +1,340 @@
+from flask import Flask, request, jsonify
+import os
+import pickle
+import base64
+import numpy as np
+from datetime import datetime, timedelta
+import math
+
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
+SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
+INTERNAL_SECRET = os.environ.get('XGB_INTERNAL_SECRET', '')
+
+MODEL_FEATURE_NAMES = {
+    'tendencia':      ['vs20','vs50','vs200','adx_norm','rsi_norm','macd_norm'],
+    'momentum':       ['rsi_norm','macd_norm','roc5','roc10','roc20'],
+    'volatilidad':    ['bb_pos','bb_squeeze','atr_norm','hv_norm'],
+    'volumen':        ['obv_dir','roc5','candle','vs20'],
+    'estructura':     ['vs50','vs200','bb_pos','adx_dir'],
+    'elliott':        ['vs20','roc10','roc20','bb_pos'],
+    'velas':          ['candle','vs20','rsi_norm','bb_pos'],
+    'macro':          ['roc20','vs200','rsi_norm','bb_pos'],
+    'fundamental':    ['roc20','vs200','rsi_norm','vs50'],
+    'sentimiento':    ['rsi_norm','bb_pos','roc5','candle'],
+    'regresion':      ['roc5','roc10','roc20','vs20'],
+    'reversion':      ['neg_vs20','neg_bb','neg_rsi','neg_vs50'],
+    'divergencias':   ['rsi_norm','macd_norm','roc5','obv_dir'],
+    'estacionalidad': ['sin_month','cos_month','rsi_norm','roc20','vs200'],
+    'beta_mercado':   ['roc5','roc10','roc20','vs200','rsi_norm'],
+    'fuerza_relativa':['roc5','roc10','roc20','vs50'],
+}
+
+MIN_MOVE_PCT = {7: 0.3, 14: 0.5, 30: 0.8, 60: 1.2, 90: 1.5}
+HORIZON_BUCKETS = [7, 14, 30, 60, 90]
+
+
+def cl(v, scale):
+    return max(-1.0, min(1.0, float(v or 0) / scale)) if scale else 0.0
+
+
+def cl3(v, lo=-3.0, hi=3.0):
+    return max(lo, min(hi, float(v or 0)))
+
+
+def extract_features(ind):
+    vs20  = cl(ind.get('price_vs_sma20', 0), 20)
+    vs50  = cl(ind.get('price_vs_sma50', 0), 20)
+    vs200 = cl(ind.get('price_vs_sma200', 0), 30)
+    rsi   = float(ind.get('rsi_14', 50) or 50)
+    rsi_norm = (rsi - 50) / 25.0
+
+    macd_h = ind.get('macd_histogram')
+    if macd_h is None:
+        macd_h = 0.1 if ind.get('macd_signal') == 'bullish_cross' else -0.1
+    macd_h = float(macd_h)
+    macd_norm = cl3(macd_h / (abs(macd_h) + 0.01)) * 0.33
+
+    bb_b   = float(ind.get('bb_pct_b', 0.5) or 0.5)
+    bb_pos = bb_b * 2 - 1
+    bb_squeeze = 1.0 if ind.get('bb_squeeze') else 0.0
+
+    atr_norm = cl(ind.get('atr_pct', 1), 5)
+    hv_norm  = cl(ind.get('hist_vol_20', 20), 100)
+
+    obv_t = ind.get('obv_trend', '')
+    obv_dir = 1.0 if obv_t == 'rising' else (-1.0 if obv_t == 'falling' else 0.0)
+
+    roc5  = cl(ind.get('roc_5', 0), 20)
+    roc10 = cl(ind.get('roc_10', 0), 30)
+    roc20 = cl(ind.get('roc_20', 0), 40)
+
+    candle = 1.0 if ind.get('candle_signal') == 'bullish' else -1.0
+
+    adx_norm = cl(ind.get('adx_14', 20), 50) - 0.4
+    adx_dir  = adx_norm
+
+    dt_str = ind.get('computed_date', '')
+    try:
+        month = datetime.strptime(dt_str, '%Y-%m-%d').month if dt_str else 6
+    except Exception:
+        month = 6
+    sin_month = math.sin(2 * math.pi * month / 12)
+    cos_month = math.cos(2 * math.pi * month / 12)
+
+    return {
+        'vs20': vs20, 'vs50': vs50, 'vs200': vs200,
+        'rsi_norm': rsi_norm, 'macd_norm': macd_norm,
+        'bb_pos': bb_pos, 'bb_squeeze': bb_squeeze,
+        'atr_norm': atr_norm, 'hv_norm': hv_norm,
+        'obv_dir': obv_dir,
+        'roc5': roc5, 'roc10': roc10, 'roc20': roc20,
+        'candle': candle,
+        'adx_norm': adx_norm, 'adx_dir': adx_dir,
+        'neg_vs20': -vs20, 'neg_bb': -bb_pos,
+        'neg_rsi': -rsi_norm, 'neg_vs50': -vs50,
+        'sin_month': sin_month, 'cos_month': cos_month,
+    }
+
+
+def train_model(model_name: str) -> dict:
+    from supabase import create_client
+    import xgboost as xgb
+
+    if model_name not in MODEL_FEATURE_NAMES:
+        raise ValueError(f'Unknown model: {model_name}')
+
+    feature_names = MODEL_FEATURE_NAMES[model_name]
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    cutoff = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+    indicators = []
+    offset = 0
+    cols = (
+        'asset_id,computed_date,price_close,'
+        'price_vs_sma20,price_vs_sma50,price_vs_sma200,'
+        'rsi_14,macd_histogram,macd_signal,bb_pct_b,bb_squeeze,'
+        'atr_pct,hist_vol_20,obv_trend,roc_5,roc_10,roc_20,'
+        'candle_signal,adx_14'
+    )
+    while True:
+        resp = sb.table('indicators').select(cols).gte(
+            'computed_date', cutoff
+        ).order('computed_date').range(offset, offset + 999).execute()
+        rows = resp.data or []
+        indicators.extend(rows)
+        if len(rows) < 1000:
+            break
+        offset += 1000
+
+    if not indicators:
+        raise ValueError('No indicator data found')
+
+    price_map: dict = {}
+    for row in indicators:
+        aid = row['asset_id']
+        dt  = row['computed_date']
+        pc  = float(row.get('price_close') or 0)
+        if pc > 0:
+            if aid not in price_map:
+                price_map[aid] = {}
+            price_map[aid][dt] = pc
+
+    bucket_results = {}
+    for bucket in HORIZON_BUCKETS:
+        min_move = MIN_MOVE_PCT[bucket]
+        X_rows, y_rows = [], []
+
+        for ind_row in indicators:
+            aid = ind_row['asset_id']
+            dt  = ind_row['computed_date']
+            close_price = float(ind_row.get('price_close') or 0)
+            if close_price <= 0:
+                continue
+
+            feats = extract_features(ind_row)
+            x = [feats[f] for f in feature_names]
+
+            try:
+                dt_obj = datetime.strptime(dt, '%Y-%m-%d')
+                target_dt = dt_obj + timedelta(days=int(bucket * 1.45))
+            except Exception:
+                continue
+
+            prices = price_map.get(aid, {})
+            future_price = None
+            for delta in range(-3, 8):
+                check = (target_dt + timedelta(days=delta)).strftime('%Y-%m-%d')
+                if check in prices:
+                    future_price = prices[check]
+                    break
+
+            if future_price is None:
+                continue
+
+            pct_change = (future_price - close_price) / close_price * 100
+            label = 1 if pct_change >= min_move else 0
+
+            X_rows.append(x)
+            y_rows.append(label)
+
+        if len(X_rows) < 50:
+            bucket_results[bucket] = {'skipped': True, 'samples': len(X_rows)}
+            continue
+
+        X = np.array(X_rows, dtype=np.float32)
+        y = np.array(y_rows, dtype=np.float32)
+
+        pos_rate = float(y.mean())
+        scale_pos_weight = (1 - pos_rate) / pos_rate if pos_rate > 0.01 else 1.0
+
+        model = xgb.XGBClassifier(
+            n_estimators=150,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            scale_pos_weight=scale_pos_weight,
+            eval_metric='logloss',
+            random_state=42,
+            verbosity=0,
+        )
+        model.fit(X, y)
+
+        train_acc = float((model.predict(X) == y).mean())
+        model_b64 = base64.b64encode(pickle.dumps(model)).decode()
+
+        sb.table('xgb_models').upsert({
+            'model_name': model_name,
+            'horizon_bucket': bucket,
+            'model_data': model_b64,
+            'feature_names': feature_names,
+            'train_accuracy': train_acc,
+            'train_samples': len(X_rows),
+        }, on_conflict='model_name,horizon_bucket').execute()
+
+        bucket_results[bucket] = {
+            'samples': len(X_rows),
+            'accuracy': round(train_acc, 4),
+            'pos_rate': round(pos_rate, 4),
+        }
+
+    return {'model_name': model_name, 'buckets': bucket_results}
+
+
+def run_predictions() -> dict:
+    from supabase import create_client
+
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    models_rows = sb.table('xgb_models').select(
+        'model_name,horizon_bucket,model_data,feature_names'
+    ).execute().data or []
+
+    if not models_rows:
+        return {'predictions': 0, 'reason': 'No trained XGBoost models found'}
+
+    models: dict = {}
+    for row in models_rows:
+        key = (row['model_name'], int(row['horizon_bucket']))
+        model = pickle.loads(base64.b64decode(row['model_data']))
+        models[key] = {'model': model, 'feature_names': row['feature_names']}
+
+    cols = (
+        'asset_id,computed_date,price_close,'
+        'price_vs_sma20,price_vs_sma50,price_vs_sma200,'
+        'rsi_14,macd_histogram,macd_signal,bb_pct_b,bb_squeeze,'
+        'atr_pct,hist_vol_20,obv_trend,roc_5,roc_10,roc_20,'
+        'candle_signal,adx_14,assets(ticker,is_active)'
+    )
+    today = datetime.now().strftime('%Y-%m-%d')
+    indicators = sb.table('indicators').select(cols).eq('computed_date', today).execute().data or []
+
+    if not indicators:
+        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        indicators = sb.table('indicators').select(cols).eq('computed_date', yesterday).execute().data or []
+
+    if not indicators:
+        return {'predictions': 0, 'reason': 'No indicator data for today'}
+
+    pred_date = indicators[0].get('computed_date', today)
+
+    rows_to_upsert = []
+    for ind_row in indicators:
+        asset_info = ind_row.get('assets') or {}
+        ticker = asset_info.get('ticker', '')
+        if not ticker:
+            continue
+
+        feats_all = extract_features(ind_row)
+
+        for (model_name, bucket), model_info in models.items():
+            feature_names = model_info['feature_names']
+            model = model_info['model']
+            x = np.array([[feats_all.get(f, 0.0) for f in feature_names]], dtype=np.float32)
+            prob_up = float(model.predict_proba(x)[0][1])
+
+            rows_to_upsert.append({
+                'ticker': ticker,
+                'model_name': model_name,
+                'horizon_bucket': bucket,
+                'probability_up': round(prob_up, 6),
+                'prediction_date': pred_date,
+            })
+
+    CHUNK = 500
+    for i in range(0, len(rows_to_upsert), CHUNK):
+        sb.table('xgb_daily_predictions').upsert(
+            rows_to_upsert[i:i + CHUNK],
+            on_conflict='ticker,model_name,horizon_bucket,prediction_date'
+        ).execute()
+
+    return {
+        'predictions': len(rows_to_upsert),
+        'date': pred_date,
+        'assets': len(indicators),
+        'models': len(models),
+    }
+
+
+app = Flask(__name__)
+
+
+def _check_secret() -> bool:
+    secret = request.headers.get('x-internal-secret', '')
+    return not (INTERNAL_SECRET and secret != INTERNAL_SECRET)
+
+
+@app.after_request
+def _cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'content-type, authorization, x-internal-secret'
+    return response
+
+
+@app.route('/api/train_xgb', methods=['POST', 'OPTIONS'])
+def train():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    body = request.get_json(silent=True) or {}
+    model_name = body.get('model_name', 'tendencia')
+    try:
+        result = train_model(model_name)
+        return jsonify({'ok': True, **result})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/predict_xgb', methods=['POST', 'OPTIONS'])
+def predict():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    try:
+        result = run_predictions()
+        return jsonify({'ok': True, **result})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
