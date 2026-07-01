@@ -1,5 +1,4 @@
-from http.server import BaseHTTPRequestHandler
-import json
+from flask import Flask, request, jsonify
 import os
 import pickle
 import base64
@@ -130,7 +129,6 @@ def train_model(model_name: str) -> dict:
     if not indicators:
         raise ValueError('No indicator data found')
 
-    # Build asset_id -> date -> close_price lookup
     price_map: dict = {}
     for row in indicators:
         aid = row['asset_id']
@@ -156,14 +154,12 @@ def train_model(model_name: str) -> dict:
             feats = extract_features(ind_row)
             x = [feats[f] for f in feature_names]
 
-            # Approximate forward date (bucket trading days ≈ bucket*1.45 calendar days)
             try:
                 dt_obj = datetime.strptime(dt, '%Y-%m-%d')
                 target_dt = dt_obj + timedelta(days=int(bucket * 1.45))
             except Exception:
                 continue
 
-            # Find closest available price near target_dt
             prices = price_map.get(aid, {})
             future_price = None
             for delta in range(-3, 8):
@@ -225,45 +221,120 @@ def train_model(model_name: str) -> dict:
     return {'model_name': model_name, 'buckets': bucket_results}
 
 
-class handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
+def run_predictions() -> dict:
+    from supabase import create_client
 
-    def _cors(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'content-type, authorization, x-internal-secret')
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self._cors()
-        self.end_headers()
+    models_rows = sb.table('xgb_models').select(
+        'model_name,horizon_bucket,model_data,feature_names'
+    ).execute().data or []
 
-    def do_POST(self):
-        # Verify internal secret
-        secret = self.headers.get('x-internal-secret', '')
-        if INTERNAL_SECRET and secret != INTERNAL_SECRET:
-            self.send_response(403)
-            self.send_header('Content-Type', 'application/json')
-            self._cors()
-            self.end_headers()
-            self.wfile.write(b'{"ok":false,"error":"forbidden"}')
-            return
+    if not models_rows:
+        return {'predictions': 0, 'reason': 'No trained XGBoost models found'}
 
-        content_len = int(self.headers.get('Content-Length', 0))
-        body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
-        model_name = body.get('model_name', 'tendencia')
+    models: dict = {}
+    for row in models_rows:
+        key = (row['model_name'], int(row['horizon_bucket']))
+        model = pickle.loads(base64.b64decode(row['model_data']))
+        models[key] = {'model': model, 'feature_names': row['feature_names']}
 
-        try:
-            result = train_model(model_name)
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self._cors()
-            self.end_headers()
-            self.wfile.write(json.dumps({'ok': True, **result}).encode())
-        except Exception as e:
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self._cors()
-            self.end_headers()
-            self.wfile.write(json.dumps({'ok': False, 'error': str(e)}).encode())
+    cols = (
+        'asset_id,computed_date,price_close,'
+        'price_vs_sma20,price_vs_sma50,price_vs_sma200,'
+        'rsi_14,macd_histogram,macd_signal,bb_pct_b,bb_squeeze,'
+        'atr_pct,hist_vol_20,obv_trend,roc_5,roc_10,roc_20,'
+        'candle_signal,adx_14,assets(ticker,is_active)'
+    )
+    today = datetime.now().strftime('%Y-%m-%d')
+    indicators = sb.table('indicators').select(cols).eq('computed_date', today).execute().data or []
+
+    if not indicators:
+        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        indicators = sb.table('indicators').select(cols).eq('computed_date', yesterday).execute().data or []
+
+    if not indicators:
+        return {'predictions': 0, 'reason': 'No indicator data for today'}
+
+    pred_date = indicators[0].get('computed_date', today)
+
+    rows_to_upsert = []
+    for ind_row in indicators:
+        asset_info = ind_row.get('assets') or {}
+        ticker = asset_info.get('ticker', '')
+        if not ticker:
+            continue
+
+        feats_all = extract_features(ind_row)
+
+        for (model_name, bucket), model_info in models.items():
+            feature_names = model_info['feature_names']
+            model = model_info['model']
+            x = np.array([[feats_all.get(f, 0.0) for f in feature_names]], dtype=np.float32)
+            prob_up = float(model.predict_proba(x)[0][1])
+
+            rows_to_upsert.append({
+                'ticker': ticker,
+                'model_name': model_name,
+                'horizon_bucket': bucket,
+                'probability_up': round(prob_up, 6),
+                'prediction_date': pred_date,
+            })
+
+    CHUNK = 500
+    for i in range(0, len(rows_to_upsert), CHUNK):
+        sb.table('xgb_daily_predictions').upsert(
+            rows_to_upsert[i:i + CHUNK],
+            on_conflict='ticker,model_name,horizon_bucket,prediction_date'
+        ).execute()
+
+    return {
+        'predictions': len(rows_to_upsert),
+        'date': pred_date,
+        'assets': len(indicators),
+        'models': len(models),
+    }
+
+
+app = Flask(__name__)
+
+
+def _check_secret() -> bool:
+    secret = request.headers.get('x-internal-secret', '')
+    return not (INTERNAL_SECRET and secret != INTERNAL_SECRET)
+
+
+@app.after_request
+def _cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'content-type, authorization, x-internal-secret'
+    return response
+
+
+@app.route('/api/train_xgb', methods=['POST', 'OPTIONS'])
+def train():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    body = request.get_json(silent=True) or {}
+    model_name = body.get('model_name', 'tendencia')
+    try:
+        result = train_model(model_name)
+        return jsonify({'ok': True, **result})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/predict_xgb', methods=['POST', 'OPTIONS'])
+def predict():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    try:
+        result = run_predictions()
+        return jsonify({'ok': True, **result})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
