@@ -7,6 +7,7 @@ dependencies = [
     "numpy==1.26.4",
     "supabase==2.10.0",
     "flask==3.1.0",
+    "gunicorn==23.0.0",
 ]
 
 [tool.vercel]
