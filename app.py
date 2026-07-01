@@ -276,6 +276,7 @@ def _fetch_asset_rows(sb) -> dict:
 def _run_training_background(job_id: str, asset_rows: dict):
     """Called in a daemon thread — updates training_jobs[job_id] live."""
     import gc
+    import traceback
     # Pre-load xgboost + sklearn NOW while RAM is plentiful.
     # If we wait until mid-loop, OOM can silently set SKLEARN_INSTALLED=False
     # inside xgboost.sklearn, breaking XGBClassifier for the rest of the run.
@@ -295,8 +296,15 @@ def _run_training_background(job_id: str, asset_rows: dict):
             r = train_model(mn, asset_rows=asset_rows)
             job['results'][mn] = r.get('buckets', {})
         except Exception as e:
-            job['results'][mn] = {'error': str(e)}
-            print(f'[train_all] ERROR model={mn}: {e}', flush=True)
+            tb = traceback.format_exc()
+            error_msg = f'Error en modelo "{mn}": {type(e).__name__}: {e}\n\n{tb}'
+            print(f'[train_all] FATAL — stopping at model={mn}:\n{tb}', flush=True)
+            job['status'] = 'error'
+            job['error'] = error_msg
+            job['failed_model'] = mn
+            job['models_done'] = i
+            job['current_model'] = None
+            return  # abort entire run
         model_times.append(time.time() - model_start)
         job['models_done'] = i + 1
         avg = sum(model_times) / len(model_times)
@@ -615,6 +623,7 @@ def train_status_endpoint(job_id):
         'estimated_remaining': job.get('estimated_remaining'),
         'results': job.get('results') if job['status'] == 'done' else None,
         'error': job.get('error'),
+        'failed_model': job.get('failed_model'),
     })
 
 
