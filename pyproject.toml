@@ -1,2 +1,13 @@
+[project]
+name = "bg-prediccion-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "xgboost==2.1.3",
+    "numpy==1.26.4",
+    "supabase==2.10.0",
+    "flask==3.1.0",
+]
+
 [tool.vercel]
 entrypoint = "api.index:app"
