@@ -339,6 +339,16 @@ def train_model(model_name: str) -> dict:
         train_acc  = float((model.predict(X) == y).mean())
         model_b64  = base64.b64encode(pickle.dumps(model)).decode()
 
+        # Fetch previous accuracy before overwriting
+        try:
+            old_row = sb.table('xgb_models').select(
+                'train_accuracy,train_samples'
+            ).eq('model_name', model_name).eq('horizon_bucket', bucket).maybe_single().execute()
+            old_acc  = float(old_row.data['train_accuracy']) if old_row.data and old_row.data.get('train_accuracy') is not None else None
+            old_samp = int(old_row.data['train_samples'])    if old_row.data and old_row.data.get('train_samples')   is not None else None
+        except Exception:
+            old_acc, old_samp = None, None
+
         sb.table('xgb_models').upsert({
             'model_name':     model_name,
             'horizon_bucket': bucket,
@@ -348,10 +358,25 @@ def train_model(model_name: str) -> dict:
             'train_samples':  len(X_rows),
         }, on_conflict='model_name,horizon_bucket').execute()
 
+        # Record training history
+        try:
+            sb.table('xgb_training_history').insert({
+                'model_name':     model_name,
+                'horizon_bucket': bucket,
+                'old_accuracy':   old_acc,
+                'new_accuracy':   round(train_acc, 6),
+                'old_samples':    old_samp,
+                'new_samples':    len(X_rows),
+            }).execute()
+        except Exception:
+            pass  # history is non-critical
+
         bucket_results[bucket] = {
-            'samples':  len(X_rows),
-            'accuracy': round(train_acc, 4),
-            'pos_rate': round(pos_rate, 4),
+            'samples':       len(X_rows),
+            'accuracy':      round(train_acc, 4),
+            'pos_rate':      round(pos_rate, 4),
+            'old_accuracy':  round(old_acc, 4) if old_acc is not None else None,
+            'delta':         round(train_acc - old_acc, 4) if old_acc is not None else None,
         }
 
     return {'model_name': model_name, 'buckets': bucket_results}
