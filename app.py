@@ -242,10 +242,10 @@ def train_model(model_name: str) -> dict:
     feature_names = MODEL_FEATURE_NAMES[model_name]
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # Fetch all price history (paginated with larger pages)
+    # Fetch all price history (paginated — Supabase caps at 1000 rows/request)
     all_rows: list = []
     offset = 0
-    PAGE = 5000
+    PAGE = 1000
     while True:
         print(f'[train] fetching price_history offset={offset}', flush=True)
         try:
