@@ -229,20 +229,9 @@ def extract_features(ind):
 
 # ── Training ─────────────────────────────────────────────────────────────────
 
-def train_model(model_name: str) -> dict:
-    from supabase import create_client
-    import xgboost as xgb
-
-    print(f'[train] START model={model_name}', flush=True)
-    print(f'[train] SUPABASE_URL set={bool(SUPABASE_URL)} KEY set={bool(SUPABASE_KEY)}', flush=True)
-
-    if model_name not in MODEL_FEATURE_NAMES:
-        raise ValueError(f'Unknown model: {model_name}')
-
-    feature_names = MODEL_FEATURE_NAMES[model_name]
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-    # Fetch all price history (paginated — Supabase caps at 1000 rows/request)
+def _fetch_asset_rows(sb) -> dict:
+    """Fetch all price_history rows and return {asset_id: [rows]} sorted by date.
+    Called once and reused when training multiple models."""
     all_rows: list = []
     offset = 0
     PAGE = 1000
@@ -267,7 +256,6 @@ def train_model(model_name: str) -> dict:
     if not all_rows:
         raise ValueError('No price history data found')
 
-    # Group and sort by asset; normalize trade_date to string
     asset_rows: dict = defaultdict(list)
     for row in all_rows:
         if not isinstance(row['trade_date'], str):
@@ -277,8 +265,25 @@ def train_model(model_name: str) -> dict:
         asset_rows[aid].sort(key=lambda r: r['trade_date'])
 
     print(f'[train] assets grouped: {len(asset_rows)}', flush=True)
-    # Free raw list to save RAM
-    del all_rows
+    return dict(asset_rows)
+
+
+def train_model(model_name: str, asset_rows: dict = None) -> dict:
+    from supabase import create_client
+    import xgboost as xgb
+
+    print(f'[train] START model={model_name}', flush=True)
+
+    if model_name not in MODEL_FEATURE_NAMES:
+        raise ValueError(f'Unknown model: {model_name}')
+
+    feature_names = MODEL_FEATURE_NAMES[model_name]
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    # Fetch data if not pre-supplied (single-model path)
+    if asset_rows is None:
+        print(f'[train] fetching data (single-model path)', flush=True)
+        asset_rows = _fetch_asset_rows(sb)
 
     # Single pass over assets: compute features + build bucket training data directly
     # Avoids caching 37k feature dicts in memory simultaneously
@@ -503,6 +508,32 @@ def train():
     try:
         result = train_model(model_name)
         return jsonify({'ok': True, **result})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/train_xgb_all', methods=['POST', 'OPTIONS'])
+def train_all():
+    """Train all 16 XGBoost models with a single price_history fetch."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    from supabase import create_client
+    try:
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print('[train_all] fetching price data once for all models', flush=True)
+        asset_rows = _fetch_asset_rows(sb)
+        all_results = {}
+        for mn in MODEL_FEATURE_NAMES.keys():
+            print(f'[train_all] training model={mn}', flush=True)
+            try:
+                r = train_model(mn, asset_rows=asset_rows)
+                all_results[mn] = r.get('buckets', {})
+            except Exception as e:
+                all_results[mn] = {'error': str(e)}
+        print('[train_all] DONE all models', flush=True)
+        return jsonify({'ok': True, 'results': all_results, 'models_trained': len(all_results)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
