@@ -256,9 +256,11 @@ def train_model(model_name: str) -> dict:
     if not all_rows:
         raise ValueError('No price history data found')
 
-    # Group and sort by asset
+    # Group and sort by asset; normalize trade_date to string
     asset_rows: dict = defaultdict(list)
     for row in all_rows:
+        if not isinstance(row['trade_date'], str):
+            row['trade_date'] = str(row['trade_date'])
         asset_rows[row['asset_id']].append(row)
     for aid in asset_rows:
         asset_rows[aid].sort(key=lambda r: r['trade_date'])
