@@ -277,53 +277,36 @@ def train_model(model_name: str) -> dict:
         asset_rows[aid].sort(key=lambda r: r['trade_date'])
 
     print(f'[train] assets grouped: {len(asset_rows)}', flush=True)
+    # Free raw list to save RAM
+    del all_rows
 
-    # Vectorized feature computation — one pandas pass per asset
-    feat_cache: dict  = {}   # (aid, date) -> feature dict
-    price_cache: dict = {}   # (aid, date) -> close price
+    # Single pass over assets: compute features + build bucket training data directly
+    # Avoids caching 37k feature dicts in memory simultaneously
+    bucket_X: dict = {b: [] for b in HORIZON_BUCKETS}
+    bucket_y: dict = {b: [] for b in HORIZON_BUCKETS}
 
     for aid, rows in asset_rows.items():
         feats_by_date = compute_all_features_for_asset(rows)
-        for date_str, feats in feats_by_date.items():
-            feat_cache[(aid, date_str)] = feats
+        if not feats_by_date:
+            continue
+
+        d2c: dict = {}
         for r in rows:
             close_p = float(r.get('adj_close') or r.get('close') or 0)
             if close_p > 0:
-                price_cache[(aid, r['trade_date'])] = close_p
+                d2c[r['trade_date']] = close_p
 
-    print(f'[train] feat_cache size: {len(feat_cache)}, price_cache size: {len(price_cache)}', flush=True)
+        for date_str, feats in feats_by_date.items():
+            close_p = d2c.get(date_str, 0)
+            if close_p <= 0:
+                continue
+            try:
+                dt = datetime.strptime(date_str, '%Y-%m-%d')
+            except Exception:
+                continue
 
-    bucket_results = {}
-    for bucket in HORIZON_BUCKETS:
-        min_move = MIN_MOVE_PCT[bucket]
-        X_rows, y_rows = [], []
-        skipped_no_feat = 0
-        skipped_no_price = 0
-        skipped_no_future = 0
-        skipped_date_err = 0
-
-        for aid, rows in asset_rows.items():
-            d2c   = {r['trade_date']: price_cache.get((aid, r['trade_date']), 0) for r in rows}
-            dates = [r['trade_date'] for r in rows]
-
-            for date_str in dates[21:]:
-                feats = feat_cache.get((aid, date_str))
-                if feats is None:
-                    skipped_no_feat += 1
-                    continue
-                close_p = price_cache.get((aid, date_str), 0)
-                if close_p <= 0:
-                    skipped_no_price += 1
-                    continue
-
-                try:
-                    target = datetime.strptime(date_str, '%Y-%m-%d') + timedelta(days=int(bucket * 1.45))
-                except Exception as e:
-                    skipped_date_err += 1
-                    if skipped_date_err == 1:
-                        print(f'[train] date parse error: date_str={repr(date_str)} type={type(date_str)} err={e}', flush=True)
-                    continue
-
+            for bucket in HORIZON_BUCKETS:
+                target = dt + timedelta(days=int(bucket * 1.45))
                 future = None
                 for delta in range(-3, 8):
                     check = (target + timedelta(days=delta)).strftime('%Y-%m-%d')
@@ -331,16 +314,19 @@ def train_model(model_name: str) -> dict:
                     if fp > 0:
                         future = fp
                         break
-
                 if future is None:
-                    skipped_no_future += 1
                     continue
-
                 pct = (future - close_p) / close_p * 100
-                X_rows.append([feats.get(f, 0.0) for f in feature_names])
-                y_rows.append(1 if pct >= min_move else 0)
+                bucket_X[bucket].append([feats.get(f, 0.0) for f in feature_names])
+                bucket_y[bucket].append(1 if pct >= MIN_MOVE_PCT[bucket] else 0)
 
-        print(f'[train] bucket={bucket} X_rows={len(X_rows)} no_feat={skipped_no_feat} no_price={skipped_no_price} no_future={skipped_no_future} date_err={skipped_date_err}', flush=True)
+    for b in HORIZON_BUCKETS:
+        print(f'[train] bucket={b} samples={len(bucket_X[b])}', flush=True)
+
+    bucket_results = {}
+    for bucket in HORIZON_BUCKETS:
+        X_rows = bucket_X[bucket]
+        y_rows = bucket_y[bucket]
 
         if len(X_rows) < 50:
             bucket_results[bucket] = {'skipped': True, 'samples': len(X_rows)}
