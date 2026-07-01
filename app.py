@@ -233,6 +233,9 @@ def train_model(model_name: str) -> dict:
     from supabase import create_client
     import xgboost as xgb
 
+    print(f'[train] START model={model_name}', flush=True)
+    print(f'[train] SUPABASE_URL set={bool(SUPABASE_URL)} KEY set={bool(SUPABASE_KEY)}', flush=True)
+
     if model_name not in MODEL_FEATURE_NAMES:
         raise ValueError(f'Unknown model: {model_name}')
 
@@ -244,14 +247,22 @@ def train_model(model_name: str) -> dict:
     offset = 0
     PAGE = 5000
     while True:
-        resp = sb.table('price_history').select(
-            'asset_id,trade_date,open,high,low,close,volume,adj_close'
-        ).order('trade_date').range(offset, offset + PAGE - 1).execute()
-        rows = resp.data or []
+        print(f'[train] fetching price_history offset={offset}', flush=True)
+        try:
+            resp = sb.table('price_history').select(
+                'asset_id,trade_date,open,high,low,close,volume,adj_close'
+            ).order('trade_date').range(offset, offset + PAGE - 1).execute()
+            rows = resp.data or []
+            print(f'[train] got {len(rows)} rows at offset={offset}', flush=True)
+        except Exception as e:
+            print(f'[train] FETCH ERROR at offset={offset}: {e}', flush=True)
+            break
         all_rows.extend(rows)
         if len(rows) < PAGE:
             break
         offset += PAGE
+
+    print(f'[train] total rows fetched: {len(all_rows)}', flush=True)
 
     if not all_rows:
         raise ValueError('No price history data found')
@@ -264,6 +275,8 @@ def train_model(model_name: str) -> dict:
         asset_rows[row['asset_id']].append(row)
     for aid in asset_rows:
         asset_rows[aid].sort(key=lambda r: r['trade_date'])
+
+    print(f'[train] assets grouped: {len(asset_rows)}', flush=True)
 
     # Vectorized feature computation — one pandas pass per asset
     feat_cache: dict  = {}   # (aid, date) -> feature dict
@@ -278,10 +291,16 @@ def train_model(model_name: str) -> dict:
             if close_p > 0:
                 price_cache[(aid, r['trade_date'])] = close_p
 
+    print(f'[train] feat_cache size: {len(feat_cache)}, price_cache size: {len(price_cache)}', flush=True)
+
     bucket_results = {}
     for bucket in HORIZON_BUCKETS:
         min_move = MIN_MOVE_PCT[bucket]
         X_rows, y_rows = [], []
+        skipped_no_feat = 0
+        skipped_no_price = 0
+        skipped_no_future = 0
+        skipped_date_err = 0
 
         for aid, rows in asset_rows.items():
             d2c   = {r['trade_date']: price_cache.get((aid, r['trade_date']), 0) for r in rows}
@@ -290,14 +309,19 @@ def train_model(model_name: str) -> dict:
             for date_str in dates[21:]:
                 feats = feat_cache.get((aid, date_str))
                 if feats is None:
+                    skipped_no_feat += 1
                     continue
                 close_p = price_cache.get((aid, date_str), 0)
                 if close_p <= 0:
+                    skipped_no_price += 1
                     continue
 
                 try:
                     target = datetime.strptime(date_str, '%Y-%m-%d') + timedelta(days=int(bucket * 1.45))
-                except Exception:
+                except Exception as e:
+                    skipped_date_err += 1
+                    if skipped_date_err == 1:
+                        print(f'[train] date parse error: date_str={repr(date_str)} type={type(date_str)} err={e}', flush=True)
                     continue
 
                 future = None
@@ -309,11 +333,14 @@ def train_model(model_name: str) -> dict:
                         break
 
                 if future is None:
+                    skipped_no_future += 1
                     continue
 
                 pct = (future - close_p) / close_p * 100
                 X_rows.append([feats.get(f, 0.0) for f in feature_names])
                 y_rows.append(1 if pct >= min_move else 0)
+
+        print(f'[train] bucket={bucket} X_rows={len(X_rows)} no_feat={skipped_no_feat} no_price={skipped_no_price} no_future={skipped_no_future} date_err={skipped_date_err}', flush=True)
 
         if len(X_rows) < 50:
             bucket_results[bucket] = {'skipped': True, 'samples': len(X_rows)}
