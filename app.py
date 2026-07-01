@@ -4,8 +4,13 @@ import pickle
 import base64
 import numpy as np
 import math
+import threading
+import time
+import uuid
 from datetime import datetime, timedelta
 from collections import defaultdict
+
+training_jobs: dict = {}  # job_id -> live status dict
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
@@ -268,6 +273,34 @@ def _fetch_asset_rows(sb) -> dict:
     return dict(asset_rows)
 
 
+def _run_training_background(job_id: str, asset_rows: dict):
+    """Called in a daemon thread — updates training_jobs[job_id] live."""
+    import xgboost as xgb  # noqa: imported here so startup stays fast
+    job = training_jobs[job_id]
+    model_names = list(MODEL_FEATURE_NAMES.keys())
+    model_times: list = []
+
+    for i, mn in enumerate(model_names):
+        model_start = time.time()
+        job['current_model'] = mn
+        job['models_done'] = i
+        try:
+            r = train_model(mn, asset_rows=asset_rows)
+            job['results'][mn] = r.get('buckets', {})
+        except Exception as e:
+            job['results'][mn] = {'error': str(e)}
+            print(f'[train_all] ERROR model={mn}: {e}', flush=True)
+        model_times.append(time.time() - model_start)
+        job['models_done'] = i + 1
+        avg = sum(model_times) / len(model_times)
+        job['estimated_remaining'] = int(avg * (len(model_names) - (i + 1)))
+
+    job['status'] = 'done'
+    job['current_model'] = None
+    job['estimated_remaining'] = 0
+    print(f'[train_all] DONE all {len(model_names)} models', flush=True)
+
+
 def train_model(model_name: str, asset_rows: dict = None) -> dict:
     from supabase import create_client
     import xgboost as xgb
@@ -514,28 +547,65 @@ def train():
 
 @app.route('/api/train_xgb_all', methods=['POST', 'OPTIONS'])
 def train_all():
-    """Train all 16 XGBoost models with a single price_history fetch."""
+    """Start background training of all 16 models. Returns job_id immediately."""
     if request.method == 'OPTIONS':
         return '', 200
     if not _check_secret():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
-    from supabase import create_client
-    try:
-        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print('[train_all] fetching price data once for all models', flush=True)
-        asset_rows = _fetch_asset_rows(sb)
-        all_results = {}
-        for mn in MODEL_FEATURE_NAMES.keys():
-            print(f'[train_all] training model={mn}', flush=True)
-            try:
-                r = train_model(mn, asset_rows=asset_rows)
-                all_results[mn] = r.get('buckets', {})
-            except Exception as e:
-                all_results[mn] = {'error': str(e)}
-        print('[train_all] DONE all models', flush=True)
-        return jsonify({'ok': True, 'results': all_results, 'models_trained': len(all_results)})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+
+    job_id = str(uuid.uuid4())[:12]
+    training_jobs[job_id] = {
+        'status': 'fetching',
+        'current_model': None,
+        'models_done': 0,
+        'models_total': len(MODEL_FEATURE_NAMES),
+        'results': {},
+        'start_time': time.time(),
+        'estimated_remaining': None,
+        'error': None,
+    }
+
+    def run():
+        from supabase import create_client
+        job = training_jobs[job_id]
+        try:
+            sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+            print('[train_all] fetching price data once for all models', flush=True)
+            asset_rows = _fetch_asset_rows(sb)
+            job['status'] = 'training'
+            _run_training_background(job_id, asset_rows)
+        except Exception as e:
+            job['status'] = 'error'
+            job['error'] = str(e)
+            print(f'[train_all] FATAL ERROR: {e}', flush=True)
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({'ok': True, 'job_id': job_id})
+
+
+@app.route('/api/train_status/<job_id>', methods=['GET', 'OPTIONS'])
+def train_status_endpoint(job_id):
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+
+    job = training_jobs.get(job_id)
+    if not job:
+        return jsonify({'ok': False, 'error': 'Job not found (process may have restarted)'}), 404
+
+    elapsed = int(time.time() - job['start_time'])
+    return jsonify({
+        'ok': True,
+        'status': job['status'],
+        'current_model': job.get('current_model'),
+        'models_done': job.get('models_done', 0),
+        'models_total': job.get('models_total', len(MODEL_FEATURE_NAMES)),
+        'elapsed': elapsed,
+        'estimated_remaining': job.get('estimated_remaining'),
+        'results': job.get('results') if job['status'] == 'done' else None,
+        'error': job.get('error'),
+    })
 
 
 @app.route('/api/predict_xgb', methods=['POST', 'OPTIONS'])
