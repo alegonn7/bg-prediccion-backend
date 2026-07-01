@@ -275,7 +275,14 @@ def _fetch_asset_rows(sb) -> dict:
 
 def _run_training_background(job_id: str, asset_rows: dict):
     """Called in a daemon thread — updates training_jobs[job_id] live."""
-    import xgboost as xgb  # noqa: imported here so startup stays fast
+    import gc
+    # Pre-load xgboost + sklearn NOW while RAM is plentiful.
+    # If we wait until mid-loop, OOM can silently set SKLEARN_INSTALLED=False
+    # inside xgboost.sklearn, breaking XGBClassifier for the rest of the run.
+    import xgboost as xgb
+    import sklearn.base  # force sklearn fully into memory before training starts
+    gc.collect()
+
     job = training_jobs[job_id]
     model_names = list(MODEL_FEATURE_NAMES.keys())
     model_times: list = []
@@ -294,6 +301,7 @@ def _run_training_background(job_id: str, asset_rows: dict):
         job['models_done'] = i + 1
         avg = sum(model_times) / len(model_times)
         job['estimated_remaining'] = int(avg * (len(model_names) - (i + 1)))
+        gc.collect()  # free numpy arrays + pandas frames from previous model
 
     job['status'] = 'done'
     job['current_model'] = None
@@ -388,9 +396,11 @@ def train_model(model_name: str, asset_rows: dict = None) -> dict:
             verbosity=0,
         )
         model.fit(X, y)
-
-        train_acc  = float((model.predict(X) == y).mean())
+        preds      = model.predict(X)
+        train_acc  = float((preds == y).mean())
+        del preds, X, y  # free large arrays before Supabase upsert
         model_b64  = base64.b64encode(pickle.dumps(model)).decode()
+        del model  # free trained model from RAM (already serialised to b64)
 
         # Fetch previous accuracy before overwriting
         try:
