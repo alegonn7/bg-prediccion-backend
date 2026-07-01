@@ -239,18 +239,19 @@ def train_model(model_name: str) -> dict:
     feature_names = MODEL_FEATURE_NAMES[model_name]
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # Fetch all price history (paginated)
+    # Fetch all price history (paginated with larger pages)
     all_rows: list = []
     offset = 0
+    PAGE = 5000
     while True:
         resp = sb.table('price_history').select(
             'asset_id,trade_date,open,high,low,close,volume,adj_close'
-        ).order('trade_date').range(offset, offset + 999).execute()
+        ).order('trade_date').range(offset, offset + PAGE - 1).execute()
         rows = resp.data or []
         all_rows.extend(rows)
-        if len(rows) < 1000:
+        if len(rows) < PAGE:
             break
-        offset += 1000
+        offset += PAGE
 
     if not all_rows:
         raise ValueError('No price history data found')
