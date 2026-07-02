@@ -734,8 +734,9 @@ lr_training_jobs: dict = {}
 
 def _run_lr_training(job_id: str):
     from supabase import create_client
-    from sklearn.linear_model import LogisticRegression
+    from sklearn.linear_model import LogisticRegression, Ridge
     from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import r2_score
 
     job = lr_training_jobs[job_id]
     try:
@@ -766,10 +767,12 @@ def _run_lr_training(job_id: str):
         for row in all_rows:
             key = (row['model_name'], int(row['horizon_minutes']))
             if key not in groups:
-                groups[key] = {'X': [], 'y': []}
+                groups[key] = {'X': [], 'y_dir': [], 'y_mag': []}
             features = [float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES]
             groups[key]['X'].append(features)
-            groups[key]['y'].append(1 if row['direction_correct'] else 0)
+            groups[key]['y_dir'].append(1 if row['direction_correct'] else 0)
+            mag = row.get('actual_magnitude')
+            groups[key]['y_mag'].append(float(mag) if mag is not None else None)
 
         job['status'] = 'training'
         job['models_total'] = len(groups)
@@ -778,18 +781,44 @@ def _run_lr_training(job_id: str):
 
         for (model_name, horizon_minutes), data in groups.items():
             X = np.array(data['X'])
-            y = np.array(data['y'])
+            y_dir = np.array(data['y_dir'])
             if len(X) < 20:
                 continue
 
             scaler = StandardScaler()
             X_scaled = scaler.fit_transform(X)
 
+            # 1. Clasificador de dirección (existente)
             clf = LogisticRegression(max_iter=100, C=1.0, solver='liblinear')
-            clf.fit(X_scaled, y)
-            accuracy = float(clf.score(X_scaled, y))
+            clf.fit(X_scaled, y_dir)
+            accuracy = float(clf.score(X_scaled, y_dir))
 
-            upserts.append({
+            # 2. Regresión de magnitud — predice log(magnitud_real)
+            mag_coeff = None
+            mag_bias_val = None
+            mag_r2_val = None
+            avg_mag = None
+            median_mag = None
+
+            mags_raw = [m for m in data['y_mag'] if m is not None and m > 0]
+            if len(mags_raw) >= 20:
+                mags = np.array(mags_raw)
+                avg_mag = float(np.mean(mags))
+                median_mag = float(np.median(mags))
+
+                # Filtramos filas con magnitud válida
+                valid_idx = [i for i, m in enumerate(data['y_mag']) if m is not None and m > 0]
+                X_mag = X_scaled[valid_idx]
+                y_mag_log = np.log(mags + 0.01)  # log-transform para estabilidad
+
+                reg = Ridge(alpha=1.0)
+                reg.fit(X_mag, y_mag_log)
+                y_pred_log = reg.predict(X_mag)
+                mag_r2_val = float(r2_score(y_mag_log, y_pred_log))
+                mag_coeff = reg.coef_.tolist()
+                mag_bias_val = float(reg.intercept_)
+
+            upsert_row = {
                 'model_name': model_name,
                 'horizon_minutes': horizon_minutes,
                 'feature_names': LR_FEATURE_NAMES,
@@ -799,11 +828,20 @@ def _run_lr_training(job_id: str):
                 'feature_stds': scaler.scale_.tolist(),
                 'train_samples': len(X),
                 'train_accuracy': accuracy,
-                'last_updated': datetime.utcnow().isoformat(),
-            })
-            results[f'{model_name}:{horizon_minutes}'] = {'samples': len(X), 'accuracy': round(accuracy, 3)}
+                'mag_coefficients': mag_coeff,
+                'mag_bias': mag_bias_val,
+                'mag_r2': mag_r2_val,
+                'avg_actual_mag': avg_mag,
+                'median_actual_mag': median_mag,
+            }
+            upserts.append(upsert_row)
+            results[f'{model_name}:{horizon_minutes}'] = {
+                'samples': len(X), 'accuracy': round(accuracy, 3),
+                'avg_mag': round(avg_mag, 3) if avg_mag else None,
+                'mag_r2': round(mag_r2_val, 3) if mag_r2_val else None,
+            }
             job['models_done'] = len(upserts)
-            print(f'[lr_train] {model_name}:{horizon_minutes} n={len(X)} acc={accuracy:.3f}', flush=True)
+            print(f'[lr_train] {model_name}:{horizon_minutes} n={len(X)} dir_acc={accuracy:.3f} avg_mag={avg_mag:.3f if avg_mag else "N/A"}%', flush=True)
 
         # Usar RPC SECURITY DEFINER para evitar RLS en model_learned_params_intraday
         CHUNK = 50
