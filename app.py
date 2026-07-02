@@ -432,7 +432,8 @@ def train_model(model_name: str, asset_rows: dict = None) -> dict:
                 'train_accuracy': train_acc,
                 'train_samples':  len(X_rows),
             }, on_conflict='model_name,horizon_bucket').execute()
-            print(f'[train] {model_name}/{bucket}d UPDATED {old_acc:.4f if old_acc else "new"} → {train_acc:.4f}', flush=True)
+            _old_s = f'{old_acc:.4f}' if old_acc else 'new'
+            print(f'[train] {model_name}/{bucket}d UPDATED {_old_s} → {train_acc:.4f}', flush=True)
         else:
             print(f'[train] {model_name}/{bucket}d KEPT old={old_acc:.4f} >= new={train_acc:.4f}', flush=True)
 
