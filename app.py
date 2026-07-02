@@ -411,7 +411,7 @@ def train_model(model_name: str, asset_rows: dict = None) -> dict:
         model_b64  = base64.b64encode(pickle.dumps(model)).decode()
         del model  # free trained model from RAM (already serialised to b64)
 
-        # Fetch previous accuracy before overwriting
+        # Fetch previous accuracy — only overwrite model if new one is strictly better
         try:
             old_row = sb.table('xgb_models').select(
                 'train_accuracy,train_samples'
@@ -421,16 +421,24 @@ def train_model(model_name: str, asset_rows: dict = None) -> dict:
         except Exception:
             old_acc, old_samp = None, None
 
-        sb.table('xgb_models').upsert({
-            'model_name':     model_name,
-            'horizon_bucket': bucket,
-            'model_data':     model_b64,
-            'feature_names':  feature_names,
-            'train_accuracy': train_acc,
-            'train_samples':  len(X_rows),
-        }, on_conflict='model_name,horizon_bucket').execute()
+        improved = old_acc is None or train_acc > old_acc
 
-        # Record training history
+        if improved:
+            sb.table('xgb_models').upsert({
+                'model_name':     model_name,
+                'horizon_bucket': bucket,
+                'model_data':     model_b64,
+                'feature_names':  feature_names,
+                'train_accuracy': train_acc,
+                'train_samples':  len(X_rows),
+            }, on_conflict='model_name,horizon_bucket').execute()
+            print(f'[train] {model_name}/{bucket}d UPDATED {old_acc:.4f if old_acc else "new"} → {train_acc:.4f}', flush=True)
+        else:
+            print(f'[train] {model_name}/{bucket}d KEPT old={old_acc:.4f} >= new={train_acc:.4f}', flush=True)
+
+        del model_b64  # no longer needed
+
+        # Always record the attempt in history
         try:
             sb.table('xgb_training_history').insert({
                 'model_name':     model_name,
@@ -449,6 +457,7 @@ def train_model(model_name: str, asset_rows: dict = None) -> dict:
             'pos_rate':      round(pos_rate, 4),
             'old_accuracy':  round(old_acc, 4) if old_acc is not None else None,
             'delta':         round(train_acc - old_acc, 4) if old_acc is not None else None,
+            'improved':      improved,
         }
 
     return {'model_name': model_name, 'buckets': bucket_results}
