@@ -767,12 +767,14 @@ def _run_lr_training(job_id: str):
         for row in all_rows:
             key = (row['model_name'], int(row['horizon_minutes']))
             if key not in groups:
-                groups[key] = {'X': [], 'y_dir': [], 'y_mag': []}
+                groups[key] = {'X': [], 'y_dir': [], 'y_mag': [], 'y_signed': []}
             features = [float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES]
             groups[key]['X'].append(features)
             groups[key]['y_dir'].append(1 if row['direction_correct'] else 0)
             mag = row.get('actual_magnitude')
             groups[key]['y_mag'].append(float(mag) if mag is not None else None)
+            signed = row.get('actual_signed_pct')
+            groups[key]['y_signed'].append(float(signed) if signed is not None else None)
 
         job['status'] = 'training'
         job['models_total'] = len(groups)
@@ -818,6 +820,20 @@ def _run_lr_training(job_id: str):
                 mag_coeff = reg.coef_.tolist()
                 mag_bias_val = float(reg.intercept_)
 
+            # 3. Modelo unificado: Ridge sobre % firmado → predice dirección + magnitud en un solo paso
+            signed_coeff = None
+            signed_bias_val = None
+            signed_r2_val = None
+            valid_signed_idx = [i for i, v in enumerate(data['y_signed']) if v is not None]
+            if len(valid_signed_idx) >= 20:
+                X_signed = X_scaled[valid_signed_idx]
+                y_signed = np.array([data['y_signed'][i] for i in valid_signed_idx])
+                reg_signed = Ridge(alpha=1.0)
+                reg_signed.fit(X_signed, y_signed)
+                signed_r2_val = float(r2_score(y_signed, reg_signed.predict(X_signed)))
+                signed_coeff = reg_signed.coef_.tolist()
+                signed_bias_val = float(reg_signed.intercept_)
+
             upsert_row = {
                 'model_name': model_name,
                 'horizon_minutes': horizon_minutes,
@@ -833,6 +849,9 @@ def _run_lr_training(job_id: str):
                 'mag_r2': mag_r2_val,
                 'avg_actual_mag': avg_mag,
                 'median_actual_mag': median_mag,
+                'signed_coefficients': signed_coeff,
+                'signed_bias': signed_bias_val,
+                'signed_r2': signed_r2_val,
             }
             upserts.append(upsert_row)
             results[f'{model_name}:{horizon_minutes}'] = {
@@ -841,7 +860,9 @@ def _run_lr_training(job_id: str):
                 'mag_r2': round(mag_r2_val, 3) if mag_r2_val else None,
             }
             job['models_done'] = len(upserts)
-            print(f'[lr_train] {model_name}:{horizon_minutes} n={len(X)} dir_acc={accuracy:.3f} avg_mag={avg_mag:.3f if avg_mag else "N/A"}%', flush=True)
+            _mag_s  = f'{avg_mag:.3f}'      if avg_mag      is not None else 'N/A'
+            _sr2_s  = f'{signed_r2_val:.3f}' if signed_r2_val is not None else 'N/A'
+            print(f'[lr_train] {model_name}:{horizon_minutes} n={len(X)} dir_acc={accuracy:.3f} avg_mag={_mag_s}% signed_r2={_sr2_s}', flush=True)
 
         # Usar RPC SECURITY DEFINER para evitar RLS en model_learned_params_intraday
         CHUNK = 50
