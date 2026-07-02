@@ -806,11 +806,9 @@ def _run_lr_training(job_id: str):
             print(f'[lr_train] {model_name}:{horizon_minutes} n={len(X)} acc={accuracy:.3f}', flush=True)
 
         # Usar RPC SECURITY DEFINER para evitar RLS en model_learned_params_intraday
-        import json
         CHUNK = 50
         for i in range(0, len(upserts), CHUNK):
-            chunk = upserts[i:i + CHUNK]
-            sb.rpc('upsert_lr_params', {'p_params': json.dumps(chunk)}).execute()
+            sb.rpc('upsert_lr_params', {'p_params': upserts[i:i + CHUNK]}).execute()
 
         job['status'] = 'done'
         job['models_trained'] = len(upserts)
