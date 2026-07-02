@@ -728,6 +728,10 @@ LR_FEATURE_NAMES = [
     'score_divergencias', 'score_beta_mercado', 'score_vwap', 'score_apertura', 'score_horario',
     'rsi_7', 'price_vs_vwap', 'bb_pct_b', 'volume_ratio',
     'momentum_15m', 'momentum_30m', 'momentum_60m', 'atr_pct', 'minutes_since_open',
+    # Phase 2: market-context features
+    'spy_return_15m', 'spy_return_session', 'premarket_gap', 'prev_day_return',
+    # Phase 3: session timing
+    'minutes_to_close',
 ]
 
 lr_training_jobs: dict = {}
@@ -738,12 +742,23 @@ def _run_lr_training(job_id: str):
     from sklearn.linear_model import LogisticRegression, Ridge
     from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import r2_score
+    import lightgbm as lgb
+    from datetime import timezone
 
     job = lr_training_jobs[job_id]
+    HALF_LIFE_DAYS = 90
+    lam = math.log(2) / HALF_LIFE_DAYS
+
+    def _parse_ts(ts):
+        if not ts:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if isinstance(ts, str):
+            return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        return ts if getattr(ts, 'tzinfo', None) else ts.replace(tzinfo=timezone.utc)
+
     try:
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        # Paginated fetch via PostgREST RPC
         all_rows = []
         batch_size = 1000
         offset = 0
@@ -763,19 +778,26 @@ def _run_lr_training(job_id: str):
             job['models_trained'] = 0
             return
 
-        # Group by (model_name, horizon_minutes)
+        now_utc = datetime.now(timezone.utc)
+        all_rows.sort(key=lambda r: _parse_ts(r.get('created_at')))
+        holdout_cutoff = now_utc - timedelta(days=30)
+
+        def decay_w(ts_str):
+            age = (now_utc - _parse_ts(ts_str)).total_seconds() / 86400
+            return math.exp(-lam * max(0.0, age))
+
+        # Group chronologically by (model_name, horizon_minutes)
         groups: dict = {}
         for row in all_rows:
             key = (row['model_name'], int(row['horizon_minutes']))
             if key not in groups:
-                groups[key] = {'X': [], 'y_dir': [], 'y_mag': [], 'y_signed': []}
-            features = [float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES]
-            groups[key]['X'].append(features)
+                groups[key] = {'X': [], 'y_dir': [], 'y_signed': [], 'y_mag': [], 'w': [], 'ts': []}
+            groups[key]['X'].append([float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES])
             groups[key]['y_dir'].append(1 if row['direction_correct'] else 0)
-            mag = row.get('actual_magnitude')
-            groups[key]['y_mag'].append(float(mag) if mag is not None else None)
-            signed = row.get('actual_signed_pct')
-            groups[key]['y_signed'].append(float(signed) if signed is not None else None)
+            groups[key]['y_signed'].append(row.get('actual_signed_pct'))
+            groups[key]['y_mag'].append(row.get('actual_magnitude'))
+            groups[key]['w'].append(decay_w(row.get('created_at')))
+            groups[key]['ts'].append(row.get('created_at'))
 
         job['status'] = 'training'
         job['models_total'] = len(groups)
@@ -783,59 +805,98 @@ def _run_lr_training(job_id: str):
         results = {}
 
         for (model_name, horizon_minutes), data in groups.items():
-            X = np.array(data['X'])
-            y_dir = np.array(data['y_dir'])
-            if len(X) < 20:
+            n = len(data['X'])
+            if n < 20:
                 continue
 
+            X_np = np.array(data['X'], dtype=float)
+            y_dir_np = np.array(data['y_dir'], dtype=float)
+            y_signed_np = np.array([float(v) if v is not None else float('nan') for v in data['y_signed']])
+            y_mag_np = np.array([float(v) if v is not None else float('nan') for v in data['y_mag']])
+            w_np = np.array(data['w'], dtype=float)
+
+            # Walk-forward: holdout = last 30 days (never used for training)
+            holdout_mask = np.array([_parse_ts(ts) >= holdout_cutoff for ts in data['ts']])
+            tv_mask = ~holdout_mask
+            if tv_mask.sum() >= 20:
+                X_tv = X_np[tv_mask]; y_dir_tv = y_dir_np[tv_mask]
+                y_signed_tv = y_signed_np[tv_mask]; y_mag_tv = y_mag_np[tv_mask]; w_tv = w_np[tv_mask]
+            else:
+                X_tv, y_dir_tv, y_signed_tv, y_mag_tv, w_tv = X_np, y_dir_np, y_signed_np, y_mag_np, w_np
+
+            split = max(10, int(len(X_tv) * 0.8))
+            X_train, X_val = X_tv[:split], X_tv[split:]
+            y_dir_train = y_dir_tv[:split]
+            y_signed_train = y_signed_tv[:split]
+            y_signed_val = y_signed_tv[split:]
+            y_mag_train = y_mag_tv[:split]
+            w_train = w_tv[:split]
+
             scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X)
+            X_train_s = scaler.fit_transform(X_train)
+            X_val_s = scaler.transform(X_val) if len(X_val) > 0 else np.empty((0, X_train.shape[1]))
 
-            # 1. Clasificador de dirección (existente)
+            # Ridge direction classifier — kept for backward compat with inference edge function
             clf = LogisticRegression(max_iter=100, C=1.0, solver='liblinear')
-            clf.fit(X_scaled, y_dir)
-            accuracy = float(clf.score(X_scaled, y_dir))
+            clf.fit(X_train_s, y_dir_train, sample_weight=w_train)
+            accuracy = float(clf.score(X_train_s, y_dir_train))
 
-            # 2. Regresión de magnitud — predice log(magnitud_real)
-            mag_coeff = None
-            mag_bias_val = None
-            mag_r2_val = None
-            avg_mag = None
-            median_mag = None
+            # Ridge magnitude
+            mag_coeff = mag_bias_val = mag_r2_val = avg_mag = median_mag = None
+            y_mag_tv_valid = y_mag_tv[~np.isnan(y_mag_tv) & (y_mag_tv > 0)]
+            if len(y_mag_tv_valid) >= 20:
+                avg_mag = float(np.mean(y_mag_tv_valid))
+                median_mag = float(np.median(y_mag_tv_valid))
+                mag_train_mask = ~np.isnan(y_mag_train) & (y_mag_train > 0)
+                if mag_train_mask.sum() >= 10:
+                    y_mag_log = np.log(y_mag_train[mag_train_mask] + 0.01)
+                    reg_m = Ridge(alpha=1.0)
+                    reg_m.fit(X_train_s[mag_train_mask], y_mag_log)
+                    mag_r2_val = float(r2_score(y_mag_log, reg_m.predict(X_train_s[mag_train_mask])))
+                    mag_coeff = reg_m.coef_.tolist()
+                    mag_bias_val = float(reg_m.intercept_)
 
-            mags_raw = [m for m in data['y_mag'] if m is not None and m > 0]
-            if len(mags_raw) >= 20:
-                mags = np.array(mags_raw)
-                avg_mag = float(np.mean(mags))
-                median_mag = float(np.median(mags))
+            # Ridge signed — kept for backward compat
+            signed_coeff = signed_bias_val = signed_r2_val = val_mae_ridge = None
+            Xs = ys = ws = None
+            train_signed_mask = ~np.isnan(y_signed_train)
+            if train_signed_mask.sum() >= 20:
+                Xs = X_train_s[train_signed_mask]
+                ys = y_signed_train[train_signed_mask]
+                ws = w_train[train_signed_mask]
+                reg_s = Ridge(alpha=1.0)
+                reg_s.fit(Xs, ys, sample_weight=ws)
+                signed_r2_val = float(r2_score(ys, reg_s.predict(Xs)))
+                signed_coeff = reg_s.coef_.tolist()
+                signed_bias_val = float(reg_s.intercept_)
+                if len(X_val_s) > 0:
+                    val_sm = ~np.isnan(y_signed_val)
+                    if val_sm.sum() > 0:
+                        val_mae_ridge = float(np.mean(np.abs(
+                            y_signed_val[val_sm] - reg_s.predict(X_val_s[val_sm])
+                        )))
 
-                # Filtramos filas con magnitud válida
-                valid_idx = [i for i, m in enumerate(data['y_mag']) if m is not None and m > 0]
-                X_mag = X_scaled[valid_idx]
-                y_mag_log = np.log(mags + 0.01)  # log-transform para estabilidad
+            # LightGBM on signed target — OOS val MAE is the key metric
+            # Uses early stopping against the val set so tree count is self-tuned
+            lgbm_model_b64 = lgbm_val_mae = lgbm_importance = None
+            if Xs is not None and len(Xs) >= 30:
+                val_sm = ~np.isnan(y_signed_val) if len(X_val_s) > 0 else np.zeros(0, dtype=bool)
+                eval_set = [(X_val_s[val_sm], y_signed_val[val_sm])] if val_sm.sum() >= 5 else None
+                callbacks = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set else None
+                lgb_reg = lgb.LGBMRegressor(
+                    n_estimators=500, learning_rate=0.05, num_leaves=31,
+                    min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
+                    random_state=42, verbose=-1,
+                )
+                lgb_reg.fit(Xs, ys, sample_weight=ws, eval_set=eval_set, callbacks=callbacks)
+                if val_sm.sum() > 0:
+                    lgbm_val_mae = float(np.mean(np.abs(
+                        y_signed_val[val_sm] - lgb_reg.predict(X_val_s[val_sm])
+                    )))
+                lgbm_model_b64 = base64.b64encode(pickle.dumps(lgb_reg)).decode('utf-8')
+                lgbm_importance = dict(zip(LR_FEATURE_NAMES, lgb_reg.feature_importances_.tolist()))
 
-                reg = Ridge(alpha=1.0)
-                reg.fit(X_mag, y_mag_log)
-                y_pred_log = reg.predict(X_mag)
-                mag_r2_val = float(r2_score(y_mag_log, y_pred_log))
-                mag_coeff = reg.coef_.tolist()
-                mag_bias_val = float(reg.intercept_)
-
-            # 3. Modelo unificado: Ridge sobre % firmado → predice dirección + magnitud en un solo paso
-            signed_coeff = None
-            signed_bias_val = None
-            signed_r2_val = None
-            valid_signed_idx = [i for i, v in enumerate(data['y_signed']) if v is not None]
-            if len(valid_signed_idx) >= 20:
-                X_signed = X_scaled[valid_signed_idx]
-                y_signed = np.array([data['y_signed'][i] for i in valid_signed_idx])
-                reg_signed = Ridge(alpha=1.0)
-                reg_signed.fit(X_signed, y_signed)
-                signed_r2_val = float(r2_score(y_signed, reg_signed.predict(X_signed)))
-                signed_coeff = reg_signed.coef_.tolist()
-                signed_bias_val = float(reg_signed.intercept_)
-
-            upsert_row = {
+            upserts.append({
                 'model_name': model_name,
                 'horizon_minutes': horizon_minutes,
                 'feature_names': LR_FEATURE_NAMES,
@@ -843,7 +904,7 @@ def _run_lr_training(job_id: str):
                 'bias': float(clf.intercept_[0]),
                 'feature_means': scaler.mean_.tolist(),
                 'feature_stds': scaler.scale_.tolist(),
-                'train_samples': len(X),
+                'train_samples': len(X_tv),
                 'train_accuracy': accuracy,
                 'mag_coefficients': mag_coeff,
                 'mag_bias': mag_bias_val,
@@ -853,19 +914,24 @@ def _run_lr_training(job_id: str):
                 'signed_coefficients': signed_coeff,
                 'signed_bias': signed_bias_val,
                 'signed_r2': signed_r2_val,
-            }
-            upserts.append(upsert_row)
+                'lgbm_model': lgbm_model_b64,
+                'lgbm_val_mae': lgbm_val_mae,
+                'lgbm_feature_importance': lgbm_importance,
+                'val_mae_ridge': val_mae_ridge,
+            })
             results[f'{model_name}:{horizon_minutes}'] = {
-                'samples': len(X), 'accuracy': round(accuracy, 3),
+                'samples': len(X_tv), 'accuracy': round(accuracy, 3),
                 'avg_mag': round(avg_mag, 3) if avg_mag else None,
-                'mag_r2': round(mag_r2_val, 3) if mag_r2_val else None,
+                'val_mae_ridge': round(val_mae_ridge, 3) if val_mae_ridge else None,
+                'lgbm_val_mae': round(lgbm_val_mae, 3) if lgbm_val_mae else None,
             }
             job['models_done'] = len(upserts)
-            _mag_s  = f'{avg_mag:.3f}'      if avg_mag      is not None else 'N/A'
-            _sr2_s  = f'{signed_r2_val:.3f}' if signed_r2_val is not None else 'N/A'
-            print(f'[lr_train] {model_name}:{horizon_minutes} n={len(X)} dir_acc={accuracy:.3f} avg_mag={_mag_s}% signed_r2={_sr2_s}', flush=True)
+            print(
+                f'[lr_train] {model_name}:{horizon_minutes} n={len(X_tv)} acc={accuracy:.3f} '
+                f'val_mae_ridge={val_mae_ridge} lgbm_val_mae={lgbm_val_mae}',
+                flush=True,
+            )
 
-        # Usar RPC SECURITY DEFINER para evitar RLS en model_learned_params_intraday
         CHUNK = 50
         for i in range(0, len(upserts), CHUNK):
             sb.rpc('upsert_lr_params', {'p_params': upserts[i:i + CHUNK]}).execute()
@@ -982,8 +1048,20 @@ def _run_lr_training_daily(job_id: str):
     from sklearn.linear_model import Ridge
     from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import r2_score
+    import lightgbm as lgb
+    from datetime import timezone
 
     job = daily_training_jobs[job_id]
+    HALF_LIFE_DAYS = 180
+    lam = math.log(2) / HALF_LIFE_DAYS
+
+    def _parse_ts(ts):
+        if not ts:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if isinstance(ts, str):
+            return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        return ts if getattr(ts, 'tzinfo', None) else ts.replace(tzinfo=timezone.utc)
+
     try:
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
         job['status'] = 'fetching'
@@ -998,8 +1076,16 @@ def _run_lr_training_daily(job_id: str):
             job['error'] = 'No training data found'
             return
 
+        now_utc = datetime.now(timezone.utc)
+        all_rows.sort(key=lambda r: _parse_ts(r.get('created_at')))
+        holdout_cutoff = now_utc - timedelta(days=30)
+
+        def decay_w(ts_str):
+            age = (now_utc - _parse_ts(ts_str)).total_seconds() / 86400
+            return math.exp(-lam * max(0.0, age))
+
         BUCKETS = [7, 14, 30, 60, 90]
-        groups: dict = {b: {'X': [], 'y': []} for b in BUCKETS}
+        groups: dict = {b: {'X': [], 'y': [], 'w': [], 'ts': []} for b in BUCKETS}
         for row in all_rows:
             h = int(row.get('horizon_bucket') or 0)
             if h not in groups:
@@ -1012,6 +1098,8 @@ def _run_lr_training_daily(job_id: str):
                 continue
             groups[h]['X'].append(feats)
             groups[h]['y'].append(float(signed_pct))
+            groups[h]['w'].append(decay_w(row.get('created_at')))
+            groups[h]['ts'].append(row.get('created_at'))
 
         job['status'] = 'training'
         job['models_total'] = len(BUCKETS)
@@ -1020,38 +1108,78 @@ def _run_lr_training_daily(job_id: str):
         upserts = []
         for bucket in BUCKETS:
             X_raw = groups[bucket]['X']
-            y_raw = groups[bucket]['y']
             if len(X_raw) < 20:
                 print(f'[lr_train_daily] H={bucket}: {len(X_raw)} samples — skip', flush=True)
                 job['models_done'] += 1
                 continue
 
-            X = np.array(X_raw, dtype=float)
-            y = np.array(y_raw, dtype=float)
+            X_np = np.array(X_raw, dtype=float)
+            y_np = np.array(groups[bucket]['y'], dtype=float)
+            w_np = np.array(groups[bucket]['w'], dtype=float)
+
+            # Walk-forward: holdout = last 30 days
+            holdout_mask = np.array([_parse_ts(ts) >= holdout_cutoff for ts in groups[bucket]['ts']])
+            tv_mask = ~holdout_mask
+            if tv_mask.sum() >= 20:
+                X_tv, y_tv, w_tv = X_np[tv_mask], y_np[tv_mask], w_np[tv_mask]
+            else:
+                X_tv, y_tv, w_tv = X_np, y_np, w_np
+
+            split = max(10, int(len(X_tv) * 0.8))
+            X_train, X_val = X_tv[:split], X_tv[split:]
+            y_train, y_val = y_tv[:split], y_tv[split:]
+            w_train = w_tv[:split]
 
             scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X)
+            X_train_s = scaler.fit_transform(X_train)
+            X_val_s = scaler.transform(X_val) if len(X_val) > 0 else np.empty((0, X_train.shape[1]))
 
+            # Ridge signed — kept for backward compat
             reg = Ridge(alpha=1.0)
-            reg.fit(X_scaled, y)
-            r2_val    = float(r2_score(y, reg.predict(X_scaled)))
-            avg_mag   = float(np.mean(np.abs(y)))
-            median_mag = float(np.median(np.abs(y)))
+            reg.fit(X_train_s, y_train, sample_weight=w_train)
+            r2_val = float(r2_score(y_train, reg.predict(X_train_s)))
+            avg_mag = float(np.mean(np.abs(y_tv)))
+            median_mag = float(np.median(np.abs(y_tv)))
+            val_mae_ridge = None
+            if len(X_val_s) > 0:
+                val_mae_ridge = float(np.mean(np.abs(y_val - reg.predict(X_val_s))))
+
+            # LightGBM daily — early stopping against val set, lower lr for stability
+            lgbm_model_b64 = lgbm_val_mae = None
+            if len(X_train_s) >= 30:
+                eval_set_d = [(X_val_s, y_val)] if len(X_val_s) >= 5 else None
+                callbacks_d = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_d else None
+                lgb_reg = lgb.LGBMRegressor(
+                    n_estimators=600, learning_rate=0.03, num_leaves=31,
+                    min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
+                    random_state=42, verbose=-1,
+                )
+                lgb_reg.fit(X_train_s, y_train, sample_weight=w_train, eval_set=eval_set_d, callbacks=callbacks_d)
+                if len(X_val_s) > 0:
+                    lgbm_val_mae = float(np.mean(np.abs(y_val - lgb_reg.predict(X_val_s))))
+                lgbm_model_b64 = base64.b64encode(pickle.dumps(lgb_reg)).decode('utf-8')
 
             upserts.append({
-                'horizon_bucket':    bucket,
-                'feature_names':     DAILY_FEATURE_NAMES,
-                'feature_means':     scaler.mean_.tolist(),
-                'feature_stds':      scaler.scale_.tolist(),
+                'horizon_bucket': bucket,
+                'feature_names': DAILY_FEATURE_NAMES,
+                'feature_means': scaler.mean_.tolist(),
+                'feature_stds': scaler.scale_.tolist(),
                 'signed_coefficients': reg.coef_.tolist(),
-                'signed_bias':       float(reg.intercept_),
-                'signed_r2':         round(r2_val, 4),
-                'avg_actual_mag':    round(avg_mag, 4),
+                'signed_bias': float(reg.intercept_),
+                'signed_r2': round(r2_val, 4),
+                'avg_actual_mag': round(avg_mag, 4),
                 'median_actual_mag': round(median_mag, 4),
-                'train_samples':     len(X),
+                'train_samples': len(X_tv),
+                'lgbm_model': lgbm_model_b64,
+                'lgbm_val_mae': lgbm_val_mae,
+                'val_mae_ridge': val_mae_ridge,
             })
             job['models_done'] += 1
-            print(f'[lr_train_daily] H={bucket}: n={len(X)} r2={r2_val:.3f} avg_mag={avg_mag:.2f}%', flush=True)
+            print(
+                f'[lr_train_daily] H={bucket}: n={len(X_tv)} r2={r2_val:.3f} '
+                f'val_mae_ridge={val_mae_ridge} lgbm_val_mae={lgbm_val_mae}',
+                flush=True,
+            )
 
         if upserts:
             sb.rpc('upsert_daily_signed_params', {'p_params': upserts}).execute()
@@ -1108,3 +1236,107 @@ def lr_train_daily_status(job_id):
         'elapsed': int(time.time() - job['start_time']),
         'error': job.get('error'),
     })
+
+
+# ── LightGBM model cache (refreshed every 10 min to avoid per-request DB hits) ──
+
+_lgbm_cache: dict = {}
+_lgbm_cache_ts: float = 0.0
+
+
+def _load_lgbm_models_cached():
+    global _lgbm_cache, _lgbm_cache_ts
+    if time.time() - _lgbm_cache_ts < 600 and _lgbm_cache:
+        return _lgbm_cache
+    from supabase import create_client
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    resp = sb.table('model_learned_params_intraday').select('model_name,horizon_minutes,lgbm_model').execute()
+    new_cache: dict = {}
+    for row in resp.data or []:
+        if row.get('lgbm_model'):
+            key = f"{row['model_name']}:{row['horizon_minutes']}"
+            try:
+                new_cache[key] = pickle.loads(base64.b64decode(row['lgbm_model']))
+            except Exception:
+                pass
+    _lgbm_cache = new_cache
+    _lgbm_cache_ts = time.time()
+    return _lgbm_cache
+
+
+# ── LightGBM inference endpoint ───────────────────────────────────────────────
+
+@app.route('/api/predict_lgbm_intraday', methods=['POST', 'OPTIONS'])
+def predict_lgbm_intraday():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    body = request.get_json() or {}
+    model_name = body.get('model_name')
+    horizon_minutes = body.get('horizon_minutes')
+    indicators = body.get('indicators', {})
+    if not model_name or horizon_minutes is None:
+        return jsonify({'ok': False, 'error': 'model_name and horizon_minutes required'}), 400
+    try:
+        models = _load_lgbm_models_cached()
+        key = f'{model_name}:{int(horizon_minutes)}'
+        if key not in models:
+            return jsonify({'ok': False, 'error': 'No LightGBM model found for this model/horizon'}), 404
+        X = np.array([[float(indicators.get(fn) or 0) for fn in LR_FEATURE_NAMES]])
+        pred = float(models[key].predict(X)[0])
+        return jsonify({'ok': True, 'predicted_pct': round(pred, 4)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/predict_lgbm_all', methods=['POST', 'OPTIONS'])
+def predict_lgbm_all():
+    """Batch LightGBM inference — all (model, horizon) pairs in one call.
+    Called once per asset by the edge function to avoid 39 individual HTTP requests."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    body = request.get_json() or {}
+    indicators = body.get('indicators', {})
+    try:
+        models = _load_lgbm_models_cached()
+        if not models:
+            return jsonify({'ok': True, 'predictions': {}, 'models_loaded': 0})
+        X = np.array([[float(indicators.get(fn) or 0) for fn in LR_FEATURE_NAMES]])
+        predictions = {key: round(float(m.predict(X)[0]), 4) for key, m in models.items()}
+        return jsonify({'ok': True, 'predictions': predictions, 'models_loaded': len(models)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+# ── APScheduler: auto-train daily at 21:30 UTC ────────────────────────────────
+
+def _auto_train_all():
+    """Run intraday + daily training sequentially — called by APScheduler."""
+    intra_id = str(uuid.uuid4())[:12]
+    lr_training_jobs[intra_id] = {
+        'status': 'starting', 'models_done': 0, 'models_total': 0,
+        'models_trained': 0, 'total_samples': 0, 'results': {},
+        'start_time': time.time(), 'error': None,
+    }
+    _run_lr_training(intra_id)
+
+    daily_id = str(uuid.uuid4())[:12]
+    daily_training_jobs[daily_id] = {
+        'status': 'starting', 'models_done': 0, 'models_total': 5,
+        'models_trained': 0, 'total_samples': 0,
+        'start_time': time.time(), 'error': None,
+    }
+    _run_lr_training_daily(daily_id)
+
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    _scheduler = BackgroundScheduler()
+    _scheduler.add_job(_auto_train_all, 'cron', hour=21, minute=30, timezone='UTC', id='auto_train_daily')
+    _scheduler.start()
+    print('[scheduler] APScheduler started — auto-training at 21:30 UTC daily', flush=True)
+except Exception as _sched_err:
+    print(f'[scheduler] WARNING: could not start APScheduler: {_sched_err}', flush=True)
