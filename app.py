@@ -717,3 +717,154 @@ def predict_status_endpoint(job_id):
         'result': job.get('result'),
         'error': job.get('error'),
     })
+
+
+# ── LR Intraday Training ──────────────────────────────────────────────────────
+
+LR_FEATURE_NAMES = [
+    'score_tendencia', 'score_momentum', 'score_volatilidad', 'score_volumen',
+    'score_estructura', 'score_velas', 'score_regresion', 'score_reversion',
+    'score_divergencias', 'score_beta_mercado', 'score_vwap', 'score_apertura', 'score_horario',
+    'rsi_7', 'price_vs_vwap', 'bb_pct_b', 'volume_ratio',
+    'momentum_15m', 'momentum_30m', 'momentum_60m', 'atr_pct', 'minutes_since_open',
+]
+
+lr_training_jobs: dict = {}
+
+
+def _run_lr_training(job_id: str):
+    from supabase import create_client
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+
+    job = lr_training_jobs[job_id]
+    try:
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        # Paginated fetch via PostgREST RPC
+        all_rows = []
+        batch_size = 1000
+        offset = 0
+        job['status'] = 'fetching'
+        while True:
+            resp = sb.rpc('get_intraday_training_data').range(offset, offset + batch_size - 1).execute()
+            batch = resp.data or []
+            all_rows.extend(batch)
+            print(f'[lr_train] fetched offset={offset} got={len(batch)} total={len(all_rows)}', flush=True)
+            if len(batch) < batch_size:
+                break
+            offset += batch_size
+
+        job['total_samples'] = len(all_rows)
+        if not all_rows:
+            job['status'] = 'done'
+            job['models_trained'] = 0
+            return
+
+        # Group by (model_name, horizon_minutes)
+        groups: dict = {}
+        for row in all_rows:
+            key = (row['model_name'], int(row['horizon_minutes']))
+            if key not in groups:
+                groups[key] = {'X': [], 'y': []}
+            features = [float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES]
+            groups[key]['X'].append(features)
+            groups[key]['y'].append(1 if row['direction_correct'] else 0)
+
+        job['status'] = 'training'
+        job['models_total'] = len(groups)
+        upserts = []
+        results = {}
+
+        for (model_name, horizon_minutes), data in groups.items():
+            X = np.array(data['X'])
+            y = np.array(data['y'])
+            if len(X) < 20:
+                continue
+
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+
+            clf = LogisticRegression(max_iter=200, C=10.0, solver='lbfgs')
+            clf.fit(X_scaled, y)
+            accuracy = float(clf.score(X_scaled, y))
+
+            upserts.append({
+                'model_name': model_name,
+                'horizon_minutes': horizon_minutes,
+                'feature_names': LR_FEATURE_NAMES,
+                'coefficients': clf.coef_[0].tolist(),
+                'bias': float(clf.intercept_[0]),
+                'feature_means': scaler.mean_.tolist(),
+                'feature_stds': scaler.scale_.tolist(),
+                'train_samples': len(X),
+                'train_accuracy': accuracy,
+                'last_updated': datetime.utcnow().isoformat(),
+            })
+            results[f'{model_name}:{horizon_minutes}'] = {'samples': len(X), 'accuracy': round(accuracy, 3)}
+            job['models_done'] = len(upserts)
+            print(f'[lr_train] {model_name}:{horizon_minutes} n={len(X)} acc={accuracy:.3f}', flush=True)
+
+        # Upsert in chunks to avoid PostgREST size limits
+        CHUNK = 50
+        for i in range(0, len(upserts), CHUNK):
+            sb.table('model_learned_params_intraday').upsert(
+                upserts[i:i + CHUNK],
+                on_conflict='model_name,horizon_minutes'
+            ).execute()
+
+        job['status'] = 'done'
+        job['models_trained'] = len(upserts)
+        job['results'] = results
+        print(f'[lr_train] done: {len(upserts)} models trained', flush=True)
+
+    except Exception as e:
+        job['status'] = 'error'
+        job['error'] = str(e)
+        print(f'[lr_train] ERROR: {e}', flush=True)
+
+
+@app.route('/api/train_lr_intraday', methods=['POST', 'OPTIONS'])
+def train_lr_intraday():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+
+    job_id = str(uuid.uuid4())[:12]
+    lr_training_jobs[job_id] = {
+        'status': 'starting',
+        'models_done': 0,
+        'models_total': 0,
+        'models_trained': 0,
+        'total_samples': 0,
+        'results': {},
+        'start_time': time.time(),
+        'error': None,
+    }
+    threading.Thread(target=_run_lr_training, args=(job_id,), daemon=True).start()
+    return jsonify({'ok': True, 'job_id': job_id})
+
+
+@app.route('/api/lr_train_status/<job_id>', methods=['GET', 'OPTIONS'])
+def lr_train_status(job_id):
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+
+    job = lr_training_jobs.get(job_id)
+    if not job:
+        return jsonify({'ok': False, 'error': 'Job not found'}), 404
+
+    return jsonify({
+        'ok': True,
+        'status': job['status'],
+        'models_done': job.get('models_done', 0),
+        'models_total': job.get('models_total', 0),
+        'models_trained': job.get('models_trained', 0),
+        'total_samples': job.get('total_samples', 0),
+        'elapsed': int(time.time() - job['start_time']),
+        'results': job.get('results', {}),
+        'error': job.get('error'),
+    })
