@@ -805,13 +805,12 @@ def _run_lr_training(job_id: str):
             job['models_done'] = len(upserts)
             print(f'[lr_train] {model_name}:{horizon_minutes} n={len(X)} acc={accuracy:.3f}', flush=True)
 
-        # Upsert in chunks to avoid PostgREST size limits
+        # Usar RPC SECURITY DEFINER para evitar RLS en model_learned_params_intraday
+        import json
         CHUNK = 50
         for i in range(0, len(upserts), CHUNK):
-            sb.table('model_learned_params_intraday').upsert(
-                upserts[i:i + CHUNK],
-                on_conflict='model_name,horizon_minutes'
-            ).execute()
+            chunk = upserts[i:i + CHUNK]
+            sb.rpc('upsert_lr_params', {'p_params': json.dumps(chunk)}).execute()
 
         job['status'] = 'done'
         job['models_trained'] = len(upserts)
