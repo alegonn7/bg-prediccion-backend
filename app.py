@@ -932,9 +932,8 @@ def _run_lr_training(job_id: str):
                 flush=True,
             )
 
-        CHUNK = 50
-        for i in range(0, len(upserts), CHUNK):
-            sb.rpc('upsert_lr_params', {'p_params': upserts[i:i + CHUNK]}).execute()
+        for u in upserts:
+            sb.rpc('upsert_lr_params', {'p_params': [u]}).execute()
 
         job['status'] = 'done'
         job['models_trained'] = len(upserts)
@@ -1181,8 +1180,8 @@ def _run_lr_training_daily(job_id: str):
                 flush=True,
             )
 
-        if upserts:
-            sb.rpc('upsert_daily_signed_params', {'p_params': upserts}).execute()
+        for u in upserts:
+            sb.rpc('upsert_daily_signed_params', {'p_params': [u]}).execute()
 
         job['status'] = 'done'
         job['models_trained'] = len(upserts)
