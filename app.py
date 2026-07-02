@@ -924,3 +924,186 @@ def lr_train_status(job_id):
         'results': job.get('results', {}),
         'error': job.get('error'),
     })
+
+
+# ── Daily signed Ridge training ───────────────────────────────────────────────
+
+DAILY_FEATURE_NAMES = [
+    'price_vs_sma20', 'price_vs_sma50', 'price_vs_sma200',
+    'rsi_norm', 'macd_norm', 'bb_pct_b_norm', 'bb_squeeze',
+    'atr_pct_norm', 'hist_vol_norm', 'adx_norm',
+    'roc_5_norm', 'roc_10_norm', 'roc_20_norm',
+    'candle_signal', 'obv_trend',
+    'month_sin', 'month_cos',
+]
+
+
+def _extract_daily_features(row: dict) -> list:
+    def cl3(v, lo=-3.0, hi=3.0): return max(lo, min(hi, float(v)))
+    vs20  = float(row.get('price_vs_sma20',  0) or 0)
+    vs50  = float(row.get('price_vs_sma50',  0) or 0)
+    vs200 = float(row.get('price_vs_sma200', 0) or 0)
+    rsi   = float(row.get('rsi_14', 50) or 50)
+    macdH = float(row.get('macd_histogram', 0) or 0)
+    bbB   = float(row.get('bb_pct_b', 0.5) or 0.5)
+    bbs   = 1.0 if row.get('bb_squeeze') else 0.0
+    atrP  = float(row.get('atr_pct', 1) or 1)
+    hv    = float(row.get('hist_vol_20', 20) or 20)
+    adx   = float(row.get('adx_14', 20) or 20)
+    roc5  = float(row.get('roc_5',  0) or 0)
+    roc10 = float(row.get('roc_10', 0) or 0)
+    roc20 = float(row.get('roc_20', 0) or 0)
+    cand_s = (row.get('candle_signal') or 'neutral').lower()
+    cand  = 1.0 if cand_s == 'bullish' else (-1.0 if cand_s == 'bearish' else 0.0)
+    obv_s = (row.get('obv_trend') or 'flat').lower()
+    obv   = 1.0 if obv_s == 'rising' else (-1.0 if obv_s == 'falling' else 0.0)
+    month = int(row.get('created_month') or 1)
+    return [
+        cl3(vs20 / 5), cl3(vs50 / 10), cl3(vs200 / 20),
+        (rsi - 50) / 25,
+        cl3(macdH / (abs(macdH) + 0.01)),
+        bbB * 2 - 1, bbs,
+        cl3(atrP / 3, 0.0, 3.0),
+        cl3(hv / 50, 0.0, 3.0),
+        cl3(adx / 50 - 0.4),
+        cl3(roc5 / 5), cl3(roc10 / 10), cl3(roc20 / 20),
+        cand, obv,
+        math.sin(2 * math.pi * month / 12),
+        math.cos(2 * math.pi * month / 12),
+    ]
+
+
+daily_training_jobs: dict = {}
+
+
+def _run_lr_training_daily(job_id: str):
+    from supabase import create_client
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import r2_score
+
+    job = daily_training_jobs[job_id]
+    try:
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        job['status'] = 'fetching'
+
+        resp = sb.rpc('get_daily_training_data', {'p_limit': 100000}).execute()
+        all_rows = resp.data or []
+        job['total_samples'] = len(all_rows)
+        print(f'[lr_train_daily] fetched {len(all_rows)} rows', flush=True)
+
+        if not all_rows:
+            job['status'] = 'error'
+            job['error'] = 'No training data found'
+            return
+
+        BUCKETS = [7, 14, 30, 60, 90]
+        groups: dict = {b: {'X': [], 'y': []} for b in BUCKETS}
+        for row in all_rows:
+            h = int(row.get('horizon_bucket') or 0)
+            if h not in groups:
+                continue
+            signed_pct = row.get('actual_signed_pct')
+            if signed_pct is None:
+                continue
+            feats = _extract_daily_features(row)
+            if len(feats) != len(DAILY_FEATURE_NAMES):
+                continue
+            groups[h]['X'].append(feats)
+            groups[h]['y'].append(float(signed_pct))
+
+        job['status'] = 'training'
+        job['models_total'] = len(BUCKETS)
+        job['models_done'] = 0
+
+        upserts = []
+        for bucket in BUCKETS:
+            X_raw = groups[bucket]['X']
+            y_raw = groups[bucket]['y']
+            if len(X_raw) < 20:
+                print(f'[lr_train_daily] H={bucket}: {len(X_raw)} samples — skip', flush=True)
+                job['models_done'] += 1
+                continue
+
+            X = np.array(X_raw, dtype=float)
+            y = np.array(y_raw, dtype=float)
+
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+
+            reg = Ridge(alpha=1.0)
+            reg.fit(X_scaled, y)
+            r2_val    = float(r2_score(y, reg.predict(X_scaled)))
+            avg_mag   = float(np.mean(np.abs(y)))
+            median_mag = float(np.median(np.abs(y)))
+
+            upserts.append({
+                'horizon_bucket':    bucket,
+                'feature_names':     DAILY_FEATURE_NAMES,
+                'feature_means':     scaler.mean_.tolist(),
+                'feature_stds':      scaler.scale_.tolist(),
+                'signed_coefficients': reg.coef_.tolist(),
+                'signed_bias':       float(reg.intercept_),
+                'signed_r2':         round(r2_val, 4),
+                'avg_actual_mag':    round(avg_mag, 4),
+                'median_actual_mag': round(median_mag, 4),
+                'train_samples':     len(X),
+            })
+            job['models_done'] += 1
+            print(f'[lr_train_daily] H={bucket}: n={len(X)} r2={r2_val:.3f} avg_mag={avg_mag:.2f}%', flush=True)
+
+        if upserts:
+            sb.rpc('upsert_daily_signed_params', {'p_params': upserts}).execute()
+
+        job['status'] = 'done'
+        job['models_trained'] = len(upserts)
+        print(f'[lr_train_daily] done: {len(upserts)} buckets trained', flush=True)
+
+    except Exception as e:
+        job['status'] = 'error'
+        job['error'] = str(e)
+        print(f'[lr_train_daily] ERROR: {e}', flush=True)
+
+
+@app.route('/api/train_lr_daily', methods=['POST', 'OPTIONS'])
+def train_lr_daily():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+
+    job_id = str(uuid.uuid4())[:12]
+    daily_training_jobs[job_id] = {
+        'status': 'starting',
+        'models_done': 0,
+        'models_total': 5,
+        'models_trained': 0,
+        'total_samples': 0,
+        'start_time': time.time(),
+        'error': None,
+    }
+    threading.Thread(target=_run_lr_training_daily, args=(job_id,), daemon=True).start()
+    return jsonify({'ok': True, 'job_id': job_id})
+
+
+@app.route('/api/lr_train_daily_status/<job_id>', methods=['GET', 'OPTIONS'])
+def lr_train_daily_status(job_id):
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+
+    job = daily_training_jobs.get(job_id)
+    if not job:
+        return jsonify({'ok': False, 'error': 'Job not found'}), 404
+
+    return jsonify({
+        'ok': True,
+        'status': job['status'],
+        'models_done': job.get('models_done', 0),
+        'models_total': job.get('models_total', 5),
+        'models_trained': job.get('models_trained', 0),
+        'total_samples': job.get('total_samples', 0),
+        'elapsed': int(time.time() - job['start_time']),
+        'error': job.get('error'),
+    })
