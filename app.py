@@ -785,7 +785,7 @@ def _run_lr_training(job_id: str):
             scaler = StandardScaler()
             X_scaled = scaler.fit_transform(X)
 
-            clf = LogisticRegression(max_iter=200, C=10.0, solver='lbfgs')
+            clf = LogisticRegression(max_iter=100, C=1.0, solver='liblinear')
             clf.fit(X_scaled, y)
             accuracy = float(clf.score(X_scaled, y))
 
