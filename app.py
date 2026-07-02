@@ -10,7 +10,8 @@ import uuid
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-training_jobs: dict = {}  # job_id -> live status dict
+training_jobs: dict = {}   # job_id -> live status dict
+prediction_jobs: dict = {} # job_id -> live status dict
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
@@ -455,24 +456,18 @@ def train_model(model_name: str, asset_rows: dict = None) -> dict:
 
 # ── Prediction ────────────────────────────────────────────────────────────────
 
-def run_predictions() -> dict:
+def run_predictions(progress_cb=None) -> dict:
+    """Generate XGBoost predictions for all assets.
+
+    Processes one model_name at a time (5 horizons) to cap peak RAM usage.
+    Loading all 80 models at once (~100 MB) caused OOM on Render free tier.
+    """
+    import gc
     from supabase import create_client
 
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    models_rows = sb.table('xgb_models').select(
-        'model_name,horizon_bucket,model_data,feature_names'
-    ).execute().data or []
-
-    if not models_rows:
-        return {'predictions': 0, 'reason': 'No trained XGBoost models found'}
-
-    models: dict = {}
-    for row in models_rows:
-        key = (row['model_name'], int(row['horizon_bucket']))
-        model = pickle.loads(base64.b64decode(row['model_data']))
-        models[key] = {'model': model, 'feature_names': row['feature_names']}
-
+    # ── 1. Fetch indicators (small, no model blobs) ───────────────────────────
     cols = (
         'asset_id,computed_date,price_close,'
         'price_vs_sma20,price_vs_sma50,price_vs_sma200,'
@@ -480,53 +475,79 @@ def run_predictions() -> dict:
         'atr_pct,hist_vol_20,obv_trend,roc_5,roc_10,roc_20,'
         'candle_signal,adx_14,assets(ticker,is_active)'
     )
-    today     = datetime.now().strftime('%Y-%m-%d')
+    today      = datetime.now().strftime('%Y-%m-%d')
     indicators = sb.table('indicators').select(cols).eq('computed_date', today).execute().data or []
-
     if not indicators:
         yesterday  = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         indicators = sb.table('indicators').select(cols).eq('computed_date', yesterday).execute().data or []
-
     if not indicators:
         return {'predictions': 0, 'reason': 'No indicator data for today'}
 
-    pred_date = indicators[0].get('computed_date', today)
+    pred_date  = indicators[0].get('computed_date', today)
+    model_names = list(MODEL_FEATURE_NAMES.keys())
+    total_preds = 0
 
-    rows_to_upsert = []
-    for ind_row in indicators:
-        asset_info = ind_row.get('assets') or {}
-        ticker = asset_info.get('ticker', '')
-        if not ticker:
+    # ── 2. One model_name at a time (5 horizons) → predict → free → repeat ───
+    for idx, model_name in enumerate(model_names):
+        if progress_cb:
+            progress_cb(model_name, idx, len(model_names))
+
+        model_rows = sb.table('xgb_models').select(
+            'horizon_bucket,model_data,feature_names'
+        ).eq('model_name', model_name).execute().data or []
+
+        if not model_rows:
+            print(f'[predict] no trained model for {model_name}, skipping', flush=True)
             continue
 
-        feats_all = extract_features(ind_row)
+        # Load 5 horizon models for this model_name
+        loaded: dict = {}
+        for row in model_rows:
+            bucket = int(row['horizon_bucket'])
+            loaded[bucket] = {
+                'model':         pickle.loads(base64.b64decode(row['model_data'])),
+                'feature_names': row['feature_names'],
+            }
+        del model_rows  # free raw b64 blobs
 
-        for (model_name, bucket), model_info in models.items():
-            feature_names = model_info['feature_names']
-            model         = model_info['model']
-            x = np.array([[feats_all.get(f, 0.0) for f in feature_names]], dtype=np.float32)
-            prob_up = float(model.predict_proba(x)[0][1])
+        batch = []
+        for ind_row in indicators:
+            ticker = (ind_row.get('assets') or {}).get('ticker', '')
+            if not ticker:
+                continue
+            feats_all = extract_features(ind_row)
+            for bucket, info in loaded.items():
+                x = np.array([[feats_all.get(f, 0.0) for f in info['feature_names']]], dtype=np.float32)
+                prob_up = float(info['model'].predict_proba(x)[0][1])
+                batch.append({
+                    'ticker':          ticker,
+                    'model_name':      model_name,
+                    'horizon_bucket':  bucket,
+                    'probability_up':  round(prob_up, 6),
+                    'prediction_date': pred_date,
+                })
 
-            rows_to_upsert.append({
-                'ticker':          ticker,
-                'model_name':      model_name,
-                'horizon_bucket':  bucket,
-                'probability_up':  round(prob_up, 6),
-                'prediction_date': pred_date,
-            })
+        del loaded  # free 5 XGBoost models before upsert
+        gc.collect()
 
-    CHUNK = 500
-    for i in range(0, len(rows_to_upsert), CHUNK):
-        sb.table('xgb_daily_predictions').upsert(
-            rows_to_upsert[i:i + CHUNK],
-            on_conflict='ticker,model_name,horizon_bucket,prediction_date'
-        ).execute()
+        CHUNK = 500
+        for i in range(0, len(batch), CHUNK):
+            sb.table('xgb_daily_predictions').upsert(
+                batch[i:i + CHUNK],
+                on_conflict='ticker,model_name,horizon_bucket,prediction_date'
+            ).execute()
+        total_preds += len(batch)
+        del batch
+        print(f'[predict] {model_name} done ({idx + 1}/{len(model_names)})', flush=True)
+
+    if progress_cb:
+        progress_cb(None, len(model_names), len(model_names))
 
     return {
-        'predictions': len(rows_to_upsert),
+        'predictions': total_preds,
         'date':        pred_date,
         'assets':      len(indicators),
-        'models':      len(models),
+        'models':      len(model_names),
     }
 
 
@@ -629,12 +650,61 @@ def train_status_endpoint(job_id):
 
 @app.route('/api/predict_xgb', methods=['POST', 'OPTIONS'])
 def predict():
+    """Start background XGBoost predictions. Returns job_id immediately."""
     if request.method == 'OPTIONS':
         return '', 200
     if not _check_secret():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
-    try:
-        result = run_predictions()
-        return jsonify({'ok': True, **result})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+
+    job_id = str(uuid.uuid4())[:12]
+    prediction_jobs[job_id] = {
+        'status': 'running',
+        'current_model': None,
+        'models_done': 0,
+        'models_total': len(MODEL_FEATURE_NAMES),
+        'start_time': time.time(),
+        'result': None,
+        'error': None,
+    }
+
+    def run():
+        import traceback
+        job = prediction_jobs[job_id]
+        def cb(mn, done, total):
+            job['current_model'] = mn
+            job['models_done']   = done
+            job['models_total']  = total
+        try:
+            result = run_predictions(progress_cb=cb)
+            job['status'] = 'done'
+            job['result'] = result
+        except Exception as e:
+            job['status'] = 'error'
+            job['error']  = f'{type(e).__name__}: {e}\n\n{traceback.format_exc()}'
+            print(f'[predict] FATAL: {e}', flush=True)
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({'ok': True, 'job_id': job_id})
+
+
+@app.route('/api/predict_status/<job_id>', methods=['GET', 'OPTIONS'])
+def predict_status_endpoint(job_id):
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+
+    job = prediction_jobs.get(job_id)
+    if not job:
+        return jsonify({'ok': False, 'error': 'Job not found (process may have restarted)'}), 404
+
+    return jsonify({
+        'ok': True,
+        'status': job['status'],
+        'current_model': job.get('current_model'),
+        'models_done': job.get('models_done', 0),
+        'models_total': job.get('models_total', len(MODEL_FEATURE_NAMES)),
+        'elapsed': int(time.time() - job['start_time']),
+        'result': job.get('result'),
+        'error': job.get('error'),
+    })
