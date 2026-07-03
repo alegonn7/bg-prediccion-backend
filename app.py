@@ -768,18 +768,10 @@ def _run_lr_training(job_id: str):
     try:
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-        all_rows = []
-        batch_size = 1000
-        offset = 0
         job['status'] = 'fetching'
-        while True:
-            resp = sb.rpc('get_intraday_training_data').range(offset, offset + batch_size - 1).execute()
-            batch = resp.data or []
-            all_rows.extend(batch)
-            print(f'[lr_train] fetched offset={offset} got={len(batch)} total={len(all_rows)}', flush=True)
-            if len(batch) < batch_size:
-                break
-            offset += batch_size
+        resp = sb.rpc('get_intraday_training_data').limit(20000).execute()
+        all_rows = resp.data or []
+        print(f'[lr_train] fetched {len(all_rows)} rows', flush=True)
 
         job['total_samples'] = len(all_rows)
         if not all_rows:
