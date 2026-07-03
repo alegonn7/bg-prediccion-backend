@@ -793,11 +793,12 @@ def _run_lr_training(job_id: str):
         for row in all_rows:
             key = (row['model_name'], int(row['horizon_minutes']))
             if key not in groups:
-                groups[key] = {'X': [], 'y_dir': [], 'y_signed': [], 'y_mag': [], 'w': [], 'ts': []}
+                groups[key] = {'X': [], 'y_dir': [], 'y_signed': [], 'y_mag': [], 'y_spy': [], 'w': [], 'ts': []}
             groups[key]['X'].append([float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES])
             groups[key]['y_dir'].append(1 if row['direction_correct'] else 0)
             groups[key]['y_signed'].append(row.get('actual_signed_pct'))
             groups[key]['y_mag'].append(row.get('actual_magnitude'))
+            groups[key]['y_spy'].append(row.get('spy_actual_pct'))
             groups[key]['w'].append(decay_w(row.get('created_at')))
             groups[key]['ts'].append(row.get('created_at'))
 
@@ -815,6 +816,7 @@ def _run_lr_training(job_id: str):
             y_dir_np = np.array(data['y_dir'], dtype=float)
             y_signed_np = np.array([float(v) if v is not None else float('nan') for v in data['y_signed']])
             y_mag_np = np.array([float(v) if v is not None else float('nan') for v in data['y_mag']])
+            y_spy_np = np.array([float(v) if v is not None else float('nan') for v in data['y_spy']])
             w_np = np.array(data['w'], dtype=float)
 
             # Walk-forward: holdout = last 30 days (never used for training)
@@ -822,15 +824,35 @@ def _run_lr_training(job_id: str):
             tv_mask = ~holdout_mask
             if tv_mask.sum() >= 20:
                 X_tv = X_np[tv_mask]; y_dir_tv = y_dir_np[tv_mask]
-                y_signed_tv = y_signed_np[tv_mask]; y_mag_tv = y_mag_np[tv_mask]; w_tv = w_np[tv_mask]
+                y_signed_tv = y_signed_np[tv_mask]; y_mag_tv = y_mag_np[tv_mask]
+                y_spy_tv = y_spy_np[tv_mask]; w_tv = w_np[tv_mask]
             else:
-                X_tv, y_dir_tv, y_signed_tv, y_mag_tv, w_tv = X_np, y_dir_np, y_signed_np, y_mag_np, w_np
+                X_tv, y_dir_tv, y_signed_tv, y_mag_tv, y_spy_tv, w_tv = (
+                    X_np, y_dir_np, y_signed_np, y_mag_np, y_spy_np, w_np)
+
+            # Compute OLS beta_spy from all tv data (y = beta*spy + idio, minimize variance)
+            beta_spy = 0.0
+            valid_beta = ~np.isnan(y_signed_tv) & ~np.isnan(y_spy_tv)
+            if valid_beta.sum() >= 20:
+                y_b = y_signed_tv[valid_beta]; spy_b = y_spy_tv[valid_beta]
+                spy_c = spy_b - spy_b.mean()
+                denom = float(np.dot(spy_c, spy_c))
+                if denom > 1e-10:
+                    beta_spy = float(np.clip(
+                        np.dot(y_b - y_b.mean(), spy_c) / denom, 0.0, 3.0
+                    ))
+
+            def apply_beta_adj(y_arr, spy_arr, beta):
+                out = y_arr.copy()
+                valid = ~np.isnan(spy_arr) & ~np.isnan(y_arr)
+                out[valid] -= beta * spy_arr[valid]
+                return out
 
             split = max(10, int(len(X_tv) * 0.8))
             X_train, X_val = X_tv[:split], X_tv[split:]
             y_dir_train = y_dir_tv[:split]
-            y_signed_train = y_signed_tv[:split]
-            y_signed_val = y_signed_tv[split:]
+            y_signed_train = apply_beta_adj(y_signed_tv[:split], y_spy_tv[:split], beta_spy)
+            y_signed_val   = apply_beta_adj(y_signed_tv[split:], y_spy_tv[split:], beta_spy)
             y_mag_train = y_mag_tv[:split]
             w_train = w_tv[:split]
 
@@ -932,6 +954,7 @@ def _run_lr_training(job_id: str):
                 'lgbm_val_mae': lgbm_val_mae,
                 'lgbm_feature_importance': lgbm_importance,
                 'val_mae_ridge': val_mae_ridge,
+                'beta_spy': beta_spy,
             })
             results[f'{model_name}:{horizon_minutes}'] = {
                 'samples': len(X_tv), 'accuracy': round(accuracy, 3),
@@ -965,9 +988,10 @@ def _run_lr_training(job_id: str):
             sess = _session_from_mso(mso)
             key = (row['model_name'], int(row['horizon_minutes']), sess)
             if key not in session_groups:
-                session_groups[key] = {'X': [], 'y_signed': [], 'w': [], 'ts': []}
+                session_groups[key] = {'X': [], 'y_signed': [], 'y_spy': [], 'w': [], 'ts': []}
             session_groups[key]['X'].append([float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES])
             session_groups[key]['y_signed'].append(row.get('actual_signed_pct'))
+            session_groups[key]['y_spy'].append(row.get('spy_actual_pct'))
             session_groups[key]['w'].append(decay_w(row.get('created_at')))
             session_groups[key]['ts'].append(row.get('created_at'))
 
@@ -976,6 +1000,7 @@ def _run_lr_training(job_id: str):
         for (model_name, horizon_minutes, session), sdata in session_groups.items():
             X_np = np.array(sdata['X'], dtype=float)
             y_np = np.array([float(v) if v is not None else float('nan') for v in sdata['y_signed']])
+            spy_np = np.array([float(v) if v is not None else float('nan') for v in sdata['y_spy']])
             w_np = np.array(sdata['w'], dtype=float)
 
             holdout_mask = np.array([_parse_ts(ts) >= holdout_cutoff for ts in sdata['ts']])
@@ -983,11 +1008,27 @@ def _run_lr_training(job_id: str):
             if tv_mask.sum() < 20:
                 tv_mask = np.ones(len(X_np), dtype=bool)
 
-            X_tv = X_np[tv_mask]; y_tv = y_np[tv_mask]; w_tv = w_np[tv_mask]
+            X_tv = X_np[tv_mask]; y_tv = y_np[tv_mask]
+            spy_tv = spy_np[tv_mask]; w_tv = w_np[tv_mask]
+
+            # Compute per-session OLS beta
+            sess_beta = 0.0
+            valid_b = ~np.isnan(y_tv) & ~np.isnan(spy_tv)
+            if valid_b.sum() >= 20:
+                y_b2 = y_tv[valid_b]; spy_b2 = spy_tv[valid_b]
+                spy_c2 = spy_b2 - spy_b2.mean()
+                d2 = float(np.dot(spy_c2, spy_c2))
+                if d2 > 1e-10:
+                    sess_beta = float(np.clip(np.dot(y_b2 - y_b2.mean(), spy_c2) / d2, 0.0, 3.0))
+
             split = max(10, int(len(X_tv) * 0.8))
             X_tr, X_v = X_tv[:split], X_tv[split:]
-            y_tr, y_v = y_tv[:split], y_tv[split:]
+            y_tr_raw, y_v_raw = y_tv[:split], y_tv[split:]
+            spy_tr, spy_v = spy_tv[:split], spy_tv[split:]
             w_tr = w_tv[:split]
+
+            y_tr = apply_beta_adj(y_tr_raw, spy_tr, sess_beta)
+            y_v  = apply_beta_adj(y_v_raw,  spy_v,  sess_beta)
 
             tr_mask = ~np.isnan(y_tr)
             if tr_mask.sum() < 20:
@@ -1013,7 +1054,7 @@ def _run_lr_training(job_id: str):
                 n_estimators=500, learning_rate=0.05, num_leaves=31,
                 min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
                 random_state=42, verbose=-1,
-                objective='quantile', alpha=0.5,
+                objective='regression',
             )
             lgb_s.fit(Xs_s, ys_norm_s, sample_weight=ws_s, eval_set=eval_set_s, callbacks=cbs)
 
@@ -1032,8 +1073,9 @@ def _run_lr_training(job_id: str):
                 'lgbm_feature_importance': dict(zip(LR_FEATURE_NAMES, lgb_s.feature_importances_.tolist())),
                 'train_samples': int(tr_mask.sum()),
                 'last_updated': now_utc.isoformat(),
+                'beta_spy': sess_beta,
             })
-            print(f'[lr_train:session] {model_name}:{horizon_minutes}:{session} n={tr_mask.sum()} val_mae={sess_val_mae}', flush=True)
+            print(f'[lr_train:session] {model_name}:{horizon_minutes}:{session} n={tr_mask.sum()} val_mae={sess_val_mae} beta={sess_beta:.3f}', flush=True)
 
         for su in session_upserts:
             sb.table('lgbm_session_models_intraday').upsert(
@@ -1355,18 +1397,23 @@ _lgbm_session_cache_ts: float = 0.0
 
 
 def _load_lgbm_models_cached():
+    """Returns dict[key] = (model, beta_spy). beta_spy=0 for old models without it."""
     global _lgbm_cache, _lgbm_cache_ts
     if time.time() - _lgbm_cache_ts < 600 and _lgbm_cache:
         return _lgbm_cache
     from supabase import create_client
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-    resp = sb.table('model_learned_params_intraday').select('model_name,horizon_minutes,lgbm_model').execute()
+    resp = sb.table('model_learned_params_intraday').select(
+        'model_name,horizon_minutes,lgbm_model,beta_spy'
+    ).execute()
     new_cache: dict = {}
     for row in resp.data or []:
         if row.get('lgbm_model'):
             key = f"{row['model_name']}:{row['horizon_minutes']}"
             try:
-                new_cache[key] = pickle.loads(base64.b64decode(row['lgbm_model']))
+                model = pickle.loads(base64.b64decode(row['lgbm_model']))
+                beta = float(row.get('beta_spy') or 0.0)
+                new_cache[key] = (model, beta)
             except Exception:
                 pass
     _lgbm_cache = new_cache
@@ -1375,21 +1422,23 @@ def _load_lgbm_models_cached():
 
 
 def _load_lgbm_session_models_cached():
-    """Load per-session LGBM models. Keys: 'model_name:horizon:session'."""
+    """Load per-session LGBM models. Keys: 'model_name:horizon:session'. Values: (model, beta_spy)."""
     global _lgbm_session_cache, _lgbm_session_cache_ts
     if time.time() - _lgbm_session_cache_ts < 600 and _lgbm_session_cache:
         return _lgbm_session_cache
     from supabase import create_client
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     resp = sb.table('lgbm_session_models_intraday').select(
-        'model_name,horizon_minutes,market_session,lgbm_model'
+        'model_name,horizon_minutes,market_session,lgbm_model,beta_spy'
     ).execute()
     new_cache: dict = {}
     for row in resp.data or []:
         if row.get('lgbm_model'):
             key = f"{row['model_name']}:{row['horizon_minutes']}:{row['market_session']}"
             try:
-                new_cache[key] = pickle.loads(base64.b64decode(row['lgbm_model']))
+                model = pickle.loads(base64.b64decode(row['lgbm_model']))
+                beta = float(row.get('beta_spy') or 0.0)
+                new_cache[key] = (model, beta)
             except Exception:
                 pass
     _lgbm_session_cache = new_cache
@@ -1423,8 +1472,12 @@ def predict_lgbm_intraday():
         key = f'{model_name}:{int(horizon_minutes)}'
         if key not in models:
             return jsonify({'ok': False, 'error': 'No LightGBM model found for this model/horizon'}), 404
+        m, beta = models[key]
         X = np.array([[float(indicators.get(fn) or 0) for fn in LR_FEATURE_NAMES]])
-        pred = float(models[key].predict(X)[0])
+        atr_idx = LR_FEATURE_NAMES.index('atr_pct')
+        atr_scale = max(0.1, float(X[0, atr_idx]))
+        spy_r15 = float(indicators.get('spy_return_15m') or 0)
+        pred = float(m.predict(X)[0]) * atr_scale + beta * spy_r15
         return jsonify({'ok': True, 'predicted_pct': round(pred, 4)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -1445,18 +1498,24 @@ def predict_lgbm_all():
         if not models:
             return jsonify({'ok': True, 'predictions': {}, 'models_loaded': 0})
         X = np.array([[float(indicators.get(fn) or 0) for fn in LR_FEATURE_NAMES]])
-        # Denormalize: models trained on y/atr_pct, so pred_pct = pred_norm * atr_pct
+        # Denormalize: models trained on y_idio/atr_pct; add back beta*spy_r15 for total prediction
         atr_idx = LR_FEATURE_NAMES.index('atr_pct')
         atr_scale = max(0.1, float(X[0, atr_idx]))
+        spy_r15 = float(indicators.get('spy_return_15m') or 0)
         # Prefer session-specific model when available (Step 7: modelos por sesión)
         session_models = _load_lgbm_session_models_cached()
         mso = float(indicators.get('minutes_since_open') or 0)
         session = _get_market_session(mso)
         predictions = {}
-        for key, global_m in models.items():
+        for key, (global_m, global_beta) in models.items():
             sess_key = f'{key}:{session}'
-            m = session_models.get(sess_key, global_m)
-            predictions[key] = round(float(m.predict(X)[0]) * atr_scale, 4)
+            sess_entry = session_models.get(sess_key)
+            if sess_entry:
+                m, beta = sess_entry
+            else:
+                m, beta = global_m, global_beta
+            pred_idio = float(m.predict(X)[0]) * atr_scale
+            predictions[key] = round(pred_idio + beta * spy_r15, 4)
         return jsonify({
             'ok': True, 'predictions': predictions,
             'models_loaded': len(models),
