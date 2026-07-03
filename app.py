@@ -732,8 +732,8 @@ LR_FEATURE_NAMES = [
     'momentum_15m', 'momentum_30m', 'momentum_60m', 'atr_pct',
     # Timing
     'minutes_since_open', 'minutes_to_close',
-    # Phase 2 features re-added once >=200 live samples with non-null values exist
-    # 'spy_return_15m', 'spy_return_session', 'premarket_gap', 'prev_day_return',
+    # SPY context + session setup (activated: >500 live samples as of 2026-07-03)
+    'spy_return_15m', 'premarket_gap', 'prev_day_return',
 ]
 
 lr_training_jobs: dict = {}
