@@ -746,6 +746,37 @@ def apply_beta_adj(y_arr, spy_arr, beta):
     return out
 
 
+def _sync_earnings_calendar():
+    """Fetch earnings dates for all active intraday tickers via yfinance and upsert to DB."""
+    import yfinance as yf
+    from supabase import create_client
+
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    resp = sb.table('assets').select('ticker').eq('is_active', True).eq('intraday_active', True).execute()
+    tickers = [r['ticker'] for r in (resp.data or [])]
+
+    upserts = []
+    for ticker in tickers:
+        try:
+            t = yf.Ticker(ticker)
+            ed = t.earnings_dates  # DataFrame index = earnings datetime (past + upcoming)
+            if ed is not None and len(ed) > 0:
+                for dt in ed.index:
+                    try:
+                        report_date = dt.date().isoformat()
+                        upserts.append({'ticker': ticker, 'report_date': report_date, 'source': 'yfinance'})
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f'[earnings_sync] {ticker}: {e}', flush=True)
+
+    if upserts:
+        sb.table('earnings_calendar').upsert(upserts, on_conflict='ticker,report_date').execute()
+
+    print(f'[earnings_sync] upserted {len(upserts)} dates for {len(tickers)} tickers', flush=True)
+    return len(upserts)
+
+
 def _run_lr_training(job_id: str):
     from supabase import create_client
     from sklearn.linear_model import LogisticRegression, Ridge
@@ -816,6 +847,33 @@ def _run_lr_training(job_id: str):
 
         now_utc = datetime.now(timezone.utc)
         all_rows.sort(key=lambda r: _parse_ts(r.get('created_at')))
+
+        # Earnings filter — sync calendar then exclude rows ±2 days from any earnings
+        try:
+            _sync_earnings_calendar()
+            ec_resp = sb.table('earnings_calendar').select('ticker, report_date').execute()
+            from collections import defaultdict as _dd
+            from datetime import date as _date
+            _earn_by_ticker = _dd(list)
+            for ec in (ec_resp.data or []):
+                try:
+                    _earn_by_ticker[ec['ticker']].append(_date.fromisoformat(ec['report_date']))
+                except Exception:
+                    pass
+
+            def _near_earnings(ticker, created_at_str):
+                row_date = _parse_ts(created_at_str).date()
+                for earn_d in _earn_by_ticker.get(ticker, []):
+                    if abs((row_date - earn_d).days) <= 2:
+                        return True
+                return False
+
+            pre_filter = len(all_rows)
+            all_rows = [r for r in all_rows if not _near_earnings(r.get('ticker', ''), r.get('created_at'))]
+            removed = pre_filter - len(all_rows)
+            print(f'[lr_train] earnings filter: {pre_filter} → {len(all_rows)} rows ({removed} removed)', flush=True)
+        except Exception as e_earn:
+            print(f'[lr_train] earnings filter skipped: {e_earn}', flush=True)
         holdout_cutoff = now_utc - timedelta(days=30)
 
         def decay_w(ts_str):
@@ -1308,6 +1366,19 @@ def train_lr_intraday():
     }
     threading.Thread(target=_run_lr_training, args=(job_id,), daemon=True).start()
     return jsonify({'ok': True, 'job_id': job_id})
+
+
+@app.route('/api/sync-earnings', methods=['POST', 'OPTIONS'])
+def sync_earnings():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    try:
+        n = _sync_earnings_calendar()
+        return jsonify({'ok': True, 'upserted': n})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 @app.route('/api/lr_train_status/<job_id>', methods=['GET', 'OPTIONS'])
