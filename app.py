@@ -948,6 +948,98 @@ def _run_lr_training(job_id: str):
         for u in upserts:
             sb.rpc('upsert_lr_params', {'p_params': [u]}).execute()
 
+        # ── Step 7: Session-specific LGBM models ─────────────────────────────
+        # Train one LGBM per (model_name, horizon_minutes, market_session).
+        # Only LightGBM — Ridge stays global for backward compat.
+        # Stored in lgbm_session_models_intraday; global model is fallback at inference.
+        def _session_from_mso(mso: float) -> str:
+            if mso < 30:  return 'open'
+            if mso < 120: return 'morning'
+            if mso < 270: return 'midday'
+            return 'close'
+
+        session_groups: dict = {}
+        for row in all_rows:
+            mso = float(row.get('minutes_since_open') or 0)
+            sess = _session_from_mso(mso)
+            key = (row['model_name'], int(row['horizon_minutes']), sess)
+            if key not in session_groups:
+                session_groups[key] = {'X': [], 'y_signed': [], 'w': [], 'ts': []}
+            session_groups[key]['X'].append([float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES])
+            session_groups[key]['y_signed'].append(row.get('actual_signed_pct'))
+            session_groups[key]['w'].append(decay_w(row.get('created_at')))
+            session_groups[key]['ts'].append(row.get('created_at'))
+
+        session_upserts = []
+        atr_idx = LR_FEATURE_NAMES.index('atr_pct')
+        for (model_name, horizon_minutes, session), sdata in session_groups.items():
+            X_np = np.array(sdata['X'], dtype=float)
+            y_np = np.array([float(v) if v is not None else float('nan') for v in sdata['y_signed']])
+            w_np = np.array(sdata['w'], dtype=float)
+
+            holdout_mask = np.array([_parse_ts(ts) >= holdout_cutoff for ts in sdata['ts']])
+            tv_mask = ~holdout_mask
+            if tv_mask.sum() < 20:
+                tv_mask = np.ones(len(X_np), dtype=bool)
+
+            X_tv = X_np[tv_mask]; y_tv = y_np[tv_mask]; w_tv = w_np[tv_mask]
+            split = max(10, int(len(X_tv) * 0.8))
+            X_tr, X_v = X_tv[:split], X_tv[split:]
+            y_tr, y_v = y_tv[:split], y_tv[split:]
+            w_tr = w_tv[:split]
+
+            tr_mask = ~np.isnan(y_tr)
+            if tr_mask.sum() < 20:
+                continue
+
+            scaler_s = StandardScaler()
+            Xs_s = scaler_s.fit_transform(X_tr[tr_mask])
+            ys_s = y_tr[tr_mask]
+            ws_s = w_tr[tr_mask]
+
+            atr_tr = np.clip(X_tr[tr_mask][:, atr_idx], 0.1, 10.0)
+            ys_norm_s = ys_s / atr_tr
+
+            X_v_s = scaler_s.transform(X_v) if len(X_v) > 0 else np.empty((0, X_tr.shape[1]))
+            val_sm_s = ~np.isnan(y_v) if len(X_v) > 0 else np.zeros(0, dtype=bool)
+            eval_set_s = None
+            if val_sm_s.sum() >= 5:
+                atr_v = np.clip(X_v[:, atr_idx][val_sm_s], 0.1, 10.0)
+                eval_set_s = [(X_v_s[val_sm_s], y_v[val_sm_s] / atr_v)]
+
+            cbs = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_s else None
+            lgb_s = lgb.LGBMRegressor(
+                n_estimators=500, learning_rate=0.05, num_leaves=31,
+                min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
+                random_state=42, verbose=-1,
+            )
+            lgb_s.fit(Xs_s, ys_norm_s, sample_weight=ws_s, eval_set=eval_set_s, callbacks=cbs)
+
+            sess_val_mae = None
+            if val_sm_s.sum() > 0:
+                atr_v2 = np.clip(X_v[:, atr_idx][val_sm_s], 0.1, 10.0)
+                preds_d = lgb_s.predict(X_v_s[val_sm_s]) * atr_v2
+                sess_val_mae = float(np.mean(np.abs(y_v[val_sm_s] - preds_d)))
+
+            session_upserts.append({
+                'model_name': model_name,
+                'horizon_minutes': horizon_minutes,
+                'market_session': session,
+                'lgbm_model': base64.b64encode(pickle.dumps(lgb_s)).decode('utf-8'),
+                'lgbm_val_mae': sess_val_mae,
+                'lgbm_feature_importance': dict(zip(LR_FEATURE_NAMES, lgb_s.feature_importances_.tolist())),
+                'train_samples': int(tr_mask.sum()),
+                'last_updated': now_utc.isoformat(),
+            })
+            print(f'[lr_train:session] {model_name}:{horizon_minutes}:{session} n={tr_mask.sum()} val_mae={sess_val_mae}', flush=True)
+
+        for su in session_upserts:
+            sb.table('lgbm_session_models_intraday').upsert(
+                su, on_conflict='model_name,horizon_minutes,market_session'
+            ).execute()
+        print(f'[lr_train] session models: {len(session_upserts)} trained', flush=True)
+        # ─────────────────────────────────────────────────────────────────────
+
         job['status'] = 'done'
         job['models_trained'] = len(upserts)
         job['results'] = results
@@ -1255,6 +1347,9 @@ def lr_train_daily_status(job_id):
 _lgbm_cache: dict = {}
 _lgbm_cache_ts: float = 0.0
 
+_lgbm_session_cache: dict = {}
+_lgbm_session_cache_ts: float = 0.0
+
 
 def _load_lgbm_models_cached():
     global _lgbm_cache, _lgbm_cache_ts
@@ -1274,6 +1369,36 @@ def _load_lgbm_models_cached():
     _lgbm_cache = new_cache
     _lgbm_cache_ts = time.time()
     return _lgbm_cache
+
+
+def _load_lgbm_session_models_cached():
+    """Load per-session LGBM models. Keys: 'model_name:horizon:session'."""
+    global _lgbm_session_cache, _lgbm_session_cache_ts
+    if time.time() - _lgbm_session_cache_ts < 600 and _lgbm_session_cache:
+        return _lgbm_session_cache
+    from supabase import create_client
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    resp = sb.table('lgbm_session_models_intraday').select(
+        'model_name,horizon_minutes,market_session,lgbm_model'
+    ).execute()
+    new_cache: dict = {}
+    for row in resp.data or []:
+        if row.get('lgbm_model'):
+            key = f"{row['model_name']}:{row['horizon_minutes']}:{row['market_session']}"
+            try:
+                new_cache[key] = pickle.loads(base64.b64decode(row['lgbm_model']))
+            except Exception:
+                pass
+    _lgbm_session_cache = new_cache
+    _lgbm_session_cache_ts = time.time()
+    return _lgbm_session_cache
+
+
+def _get_market_session(minutes_since_open: float) -> str:
+    if minutes_since_open < 30:  return 'open'
+    if minutes_since_open < 120: return 'morning'
+    if minutes_since_open < 270: return 'midday'
+    return 'close'
 
 
 # ── LightGBM inference endpoint ───────────────────────────────────────────────
@@ -1320,8 +1445,21 @@ def predict_lgbm_all():
         # Denormalize: models trained on y/atr_pct, so pred_pct = pred_norm * atr_pct
         atr_idx = LR_FEATURE_NAMES.index('atr_pct')
         atr_scale = max(0.1, float(X[0, atr_idx]))
-        predictions = {key: round(float(m.predict(X)[0]) * atr_scale, 4) for key, m in models.items()}
-        return jsonify({'ok': True, 'predictions': predictions, 'models_loaded': len(models)})
+        # Prefer session-specific model when available (Step 7: modelos por sesión)
+        session_models = _load_lgbm_session_models_cached()
+        mso = float(indicators.get('minutes_since_open') or 0)
+        session = _get_market_session(mso)
+        predictions = {}
+        for key, global_m in models.items():
+            sess_key = f'{key}:{session}'
+            m = session_models.get(sess_key, global_m)
+            predictions[key] = round(float(m.predict(X)[0]) * atr_scale, 4)
+        return jsonify({
+            'ok': True, 'predictions': predictions,
+            'models_loaded': len(models),
+            'session': session,
+            'session_models_used': sum(1 for k in models if f'{k}:{session}' in session_models),
+        })
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
