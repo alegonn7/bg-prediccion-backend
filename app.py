@@ -878,23 +878,34 @@ def _run_lr_training(job_id: str):
                             y_signed_val[val_sm] - reg_s.predict(X_val_s[val_sm])
                         )))
 
-            # LightGBM on signed target — OOS val MAE is the key metric
-            # Uses early stopping against the val set so tree count is self-tuned
+            # LightGBM — target normalized by ATR so model learns in ATR units.
+            # Inference denormalizes: pred_pct = model.predict(X) * current_atr_pct.
+            # This makes predictions comparable across high/low volatility regimes.
             lgbm_model_b64 = lgbm_val_mae = lgbm_importance = None
             if Xs is not None and len(Xs) >= 30:
+                atr_idx = LR_FEATURE_NAMES.index('atr_pct')
+                # Raw ATR for train samples (before scaling), clipped to [0.1, 10]
+                atr_train_raw = np.clip(X_train[train_signed_mask][:, atr_idx], 0.1, 10.0)
+                ys_norm = ys / atr_train_raw
+
                 val_sm = ~np.isnan(y_signed_val) if len(X_val_s) > 0 else np.zeros(0, dtype=bool)
-                eval_set = [(X_val_s[val_sm], y_signed_val[val_sm])] if val_sm.sum() >= 5 else None
-                callbacks = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set else None
+                eval_set_norm = None
+                if val_sm.sum() >= 5:
+                    atr_val_raw = np.clip(X_val[:, atr_idx][val_sm], 0.1, 10.0)
+                    y_val_norm = y_signed_val[val_sm] / atr_val_raw
+                    eval_set_norm = [(X_val_s[val_sm], y_val_norm)]
+
+                callbacks = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_norm else None
                 lgb_reg = lgb.LGBMRegressor(
                     n_estimators=500, learning_rate=0.05, num_leaves=31,
                     min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
                     random_state=42, verbose=-1,
                 )
-                lgb_reg.fit(Xs, ys, sample_weight=ws, eval_set=eval_set, callbacks=callbacks)
+                lgb_reg.fit(Xs, ys_norm, sample_weight=ws, eval_set=eval_set_norm, callbacks=callbacks)
                 if val_sm.sum() > 0:
-                    lgbm_val_mae = float(np.mean(np.abs(
-                        y_signed_val[val_sm] - lgb_reg.predict(X_val_s[val_sm])
-                    )))
+                    atr_val_raw = np.clip(X_val[:, atr_idx][val_sm], 0.1, 10.0)
+                    preds_denorm = lgb_reg.predict(X_val_s[val_sm]) * atr_val_raw
+                    lgbm_val_mae = float(np.mean(np.abs(y_signed_val[val_sm] - preds_denorm)))
                 lgbm_model_b64 = base64.b64encode(pickle.dumps(lgb_reg)).decode('utf-8')
                 lgbm_importance = dict(zip(LR_FEATURE_NAMES, lgb_reg.feature_importances_.tolist()))
 
@@ -1306,7 +1317,10 @@ def predict_lgbm_all():
         if not models:
             return jsonify({'ok': True, 'predictions': {}, 'models_loaded': 0})
         X = np.array([[float(indicators.get(fn) or 0) for fn in LR_FEATURE_NAMES]])
-        predictions = {key: round(float(m.predict(X)[0]), 4) for key, m in models.items()}
+        # Denormalize: models trained on y/atr_pct, so pred_pct = pred_norm * atr_pct
+        atr_idx = LR_FEATURE_NAMES.index('atr_pct')
+        atr_scale = max(0.1, float(X[0, atr_idx]))
+        predictions = {key: round(float(m.predict(X)[0]) * atr_scale, 4) for key, m in models.items()}
         return jsonify({'ok': True, 'predictions': predictions, 'models_loaded': len(models)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
