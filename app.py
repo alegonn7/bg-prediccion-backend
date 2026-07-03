@@ -1114,6 +1114,107 @@ def _run_lr_training(job_id: str):
                 su, on_conflict='model_name,horizon_minutes,market_session'
             ).execute()
         print(f'[lr_train] session models: {len(session_upserts)} trained', flush=True)
+
+        # ── Step 8: Per-ticker LGBM models ───────────────────────────────────
+        # Group unique (ticker, horizon) from all_rows — deduplicated across model_names.
+        ticker_horizon_data: dict = {}
+        for row in all_rows:
+            t = row.get('ticker')
+            if not t:
+                continue
+            tk = (t, int(row['horizon_minutes']))
+            if tk not in ticker_horizon_data:
+                ticker_horizon_data[tk] = {'X': [], 'y_signed': [], 'y_spy': [], 'w': [], 'ts': [], 'seen': set()}
+            # Deduplicate by (created_at) — same timestamp appears once per model_name
+            dedup_key = row.get('created_at', '')
+            if dedup_key in ticker_horizon_data[tk]['seen']:
+                continue
+            ticker_horizon_data[tk]['seen'].add(dedup_key)
+            ticker_horizon_data[tk]['X'].append([float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES])
+            ticker_horizon_data[tk]['y_signed'].append(row.get('actual_signed_pct'))
+            ticker_horizon_data[tk]['y_spy'].append(row.get('spy_actual_pct'))
+            ticker_horizon_data[tk]['w'].append(decay_w(row.get('created_at')))
+            ticker_horizon_data[tk]['ts'].append(row.get('created_at'))
+
+        ticker_upserts = []
+        for (ticker, horizon_minutes), tdata in ticker_horizon_data.items():
+            n = len(tdata['X'])
+            if n < 50:
+                continue
+            X_np = np.array(tdata['X'], dtype=float)
+            y_np = np.array([float(v) if v is not None else float('nan') for v in tdata['y_signed']])
+            spy_np = np.array([float(v) if v is not None else float('nan') for v in tdata['y_spy']])
+            w_np = np.array(tdata['w'], dtype=float)
+
+            holdout_mask = np.array([_parse_ts(ts) >= holdout_cutoff for ts in tdata['ts']])
+            tv_mask = ~holdout_mask
+            if tv_mask.sum() < 20:
+                tv_mask = np.ones(n, dtype=bool)
+            X_tv = X_np[tv_mask]; y_tv = y_np[tv_mask]
+            spy_tv = spy_np[tv_mask]; w_tv = w_np[tv_mask]
+
+            # OLS beta per ticker×horizon
+            t_beta = 0.0
+            vb = ~np.isnan(y_tv) & ~np.isnan(spy_tv)
+            if vb.sum() >= 20:
+                yb = y_tv[vb]; sb2 = spy_tv[vb]
+                sc = sb2 - sb2.mean(); d = float(np.dot(sc, sc))
+                if d > 1e-10:
+                    t_beta = float(np.clip(np.dot(yb - yb.mean(), sc) / d, 0.0, 3.0))
+
+            split = max(10, int(len(X_tv) * 0.8))
+            X_tr, X_v = X_tv[:split], X_tv[split:]
+            y_tr = apply_beta_adj(y_tv[:split], spy_tv[:split], t_beta)
+            y_v  = apply_beta_adj(y_tv[split:], spy_tv[split:], t_beta)
+            w_tr = w_tv[:split]
+
+            tm = ~np.isnan(y_tr)
+            if tm.sum() < 20:
+                continue
+
+            sc_t = StandardScaler()
+            Xs_t = sc_t.fit_transform(X_tr[tm])
+            ys_t = y_tr[tm]; ws_t = w_tr[tm]
+            atr_t = np.clip(X_tr[tm][:, atr_idx], 0.1, 10.0)
+            ys_tn = ys_t / atr_t
+
+            X_v_t = sc_t.transform(X_v) if len(X_v) > 0 else np.empty((0, X_tr.shape[1]))
+            vm_t = ~np.isnan(y_v) if len(X_v) > 0 else np.zeros(0, dtype=bool)
+            eval_t = None
+            if vm_t.sum() >= 5:
+                atr_v = np.clip(X_v[:, atr_idx][vm_t], 0.1, 10.0)
+                eval_t = [(X_v_t[vm_t], y_v[vm_t] / atr_v)]
+
+            cbs_t = [lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)] if eval_t else None
+            lgb_t = lgb.LGBMRegressor(
+                n_estimators=300, learning_rate=0.05, num_leaves=15,
+                min_child_samples=5, subsample=0.8, colsample_bytree=0.8,
+                random_state=42, verbose=-1, objective='regression_l1',
+            )
+            lgb_t.fit(Xs_t, ys_tn, sample_weight=ws_t, eval_set=eval_t, callbacks=cbs_t)
+
+            t_val_mae = None
+            if vm_t.sum() > 0:
+                atr_v = np.clip(X_v[:, atr_idx][vm_t], 0.1, 10.0)
+                preds_t = lgb_t.predict(X_v_t[vm_t]) * atr_v
+                t_val_mae = float(np.mean(np.abs(y_v[vm_t] - preds_t)))
+
+            ticker_upserts.append({
+                'ticker': ticker,
+                'horizon_minutes': horizon_minutes,
+                'lgbm_model': base64.b64encode(pickle.dumps(lgb_t)).decode('utf-8'),
+                'lgbm_val_mae': t_val_mae,
+                'beta_spy': t_beta,
+                'train_samples': int(tm.sum()),
+                'last_updated': now_utc.isoformat(),
+            })
+            print(f'[lr_train:ticker] {ticker}:{horizon_minutes} n={tm.sum()} val_mae={t_val_mae} beta={t_beta:.3f}', flush=True)
+
+        for tu in ticker_upserts:
+            sb.table('lgbm_ticker_models_intraday').upsert(
+                tu, on_conflict='ticker,horizon_minutes'
+            ).execute()
+        print(f'[lr_train] ticker models: {len(ticker_upserts)} trained', flush=True)
         # ─────────────────────────────────────────────────────────────────────
 
         job['status'] = 'done'
@@ -1427,6 +1528,9 @@ _lgbm_cache_ts: float = 0.0
 _lgbm_session_cache: dict = {}
 _lgbm_session_cache_ts: float = 0.0
 
+_lgbm_ticker_cache: dict = {}
+_lgbm_ticker_cache_ts: float = 0.0
+
 
 def _load_lgbm_models_cached():
     """Returns dict[key] = (model, beta_spy). beta_spy=0 for old models without it."""
@@ -1478,6 +1582,31 @@ def _load_lgbm_session_models_cached():
     return _lgbm_session_cache
 
 
+def _load_lgbm_ticker_models_cached():
+    """Per-ticker LGBM models. Keys: 'TICKER:horizon'. Values: (model, beta_spy)."""
+    global _lgbm_ticker_cache, _lgbm_ticker_cache_ts
+    if time.time() - _lgbm_ticker_cache_ts < 600 and _lgbm_ticker_cache:
+        return _lgbm_ticker_cache
+    from supabase import create_client
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    resp = sb.table('lgbm_ticker_models_intraday').select(
+        'ticker,horizon_minutes,lgbm_model,beta_spy'
+    ).execute()
+    new_cache: dict = {}
+    for row in resp.data or []:
+        if row.get('lgbm_model'):
+            key = f"{row['ticker']}:{row['horizon_minutes']}"
+            try:
+                model = pickle.loads(base64.b64decode(row['lgbm_model']))
+                beta = float(row.get('beta_spy') or 0.0)
+                new_cache[key] = (model, beta)
+            except Exception:
+                pass
+    _lgbm_ticker_cache = new_cache
+    _lgbm_ticker_cache_ts = time.time()
+    return _lgbm_ticker_cache
+
+
 def _get_market_session(minutes_since_open: float) -> str:
     if minutes_since_open < 30:  return 'open'
     if minutes_since_open < 120: return 'morning'
@@ -1525,33 +1654,42 @@ def predict_lgbm_all():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
     body = request.get_json() or {}
     indicators = body.get('indicators', {})
+    ticker = body.get('ticker', '')
     try:
         models = _load_lgbm_models_cached()
         if not models:
             return jsonify({'ok': True, 'predictions': {}, 'models_loaded': 0})
         X = np.array([[float(indicators.get(fn) or 0) for fn in LR_FEATURE_NAMES]])
-        # Denormalize: models trained on y_idio/atr_pct; add back beta*spy_r15 for total prediction
         atr_idx = LR_FEATURE_NAMES.index('atr_pct')
         atr_scale = max(0.1, float(X[0, atr_idx]))
         spy_r15 = float(indicators.get('spy_return_15m') or 0)
-        # Prefer session-specific model when available (Step 7: modelos por sesión)
         session_models = _load_lgbm_session_models_cached()
+        ticker_models = _load_lgbm_ticker_models_cached()
         mso = float(indicators.get('minutes_since_open') or 0)
         session = _get_market_session(mso)
+        ticker_used = 0
         predictions = {}
         for key, (global_m, global_beta) in models.items():
-            sess_key = f'{key}:{session}'
-            sess_entry = session_models.get(sess_key)
-            if sess_entry:
-                m, beta = sess_entry
+            # Priority: ticker model > session model > global model
+            horizon = key.split(':')[1]
+            t_key = f'{ticker}:{horizon}' if ticker else None
+            if t_key and t_key in ticker_models:
+                m, beta = ticker_models[t_key]
+                ticker_used += 1
             else:
-                m, beta = global_m, global_beta
+                sess_key = f'{key}:{session}'
+                sess_entry = session_models.get(sess_key)
+                if sess_entry:
+                    m, beta = sess_entry
+                else:
+                    m, beta = global_m, global_beta
             pred_idio = float(m.predict(X)[0]) * atr_scale
             predictions[key] = round(pred_idio + beta * spy_r15, 4)
         return jsonify({
             'ok': True, 'predictions': predictions,
             'models_loaded': len(models),
             'session': session,
+            'ticker_models_used': ticker_used,
             'session_models_used': sum(1 for k in models if f'{k}:{session}' in session_models),
         })
     except Exception as e:
