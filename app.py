@@ -739,6 +739,13 @@ LR_FEATURE_NAMES = [
 lr_training_jobs: dict = {}
 
 
+def apply_beta_adj(y_arr, spy_arr, beta):
+    out = y_arr.copy()
+    valid = ~np.isnan(spy_arr) & ~np.isnan(y_arr)
+    out[valid] -= beta * spy_arr[valid]
+    return out
+
+
 def _run_lr_training(job_id: str):
     from supabase import create_client
     from sklearn.linear_model import LogisticRegression, Ridge
@@ -810,12 +817,6 @@ def _run_lr_training(job_id: str):
         # Cache LGBM per horizon — data is identical across model_names for same horizon,
         # so training 13 separate LGBMs wastes compute and produces identical models.
         lgbm_horizon_cache: dict = {}  # {horizon_minutes: {model_b64, val_mae, importance, beta_spy}}
-
-        def apply_beta_adj(y_arr, spy_arr, beta):
-            out = y_arr.copy()
-            valid = ~np.isnan(spy_arr) & ~np.isnan(y_arr)
-            out[valid] -= beta * spy_arr[valid]
-            return out
 
         for (model_name, horizon_minutes), data in groups.items():
             n = len(data['X'])
@@ -1366,7 +1367,7 @@ def _run_lr_training_daily(job_id: str):
             return math.exp(-lam * max(0.0, age))
 
         BUCKETS = [7, 14, 30, 60, 90]
-        groups: dict = {b: {'X': [], 'y': [], 'w': [], 'ts': []} for b in BUCKETS}
+        groups: dict = {b: {'X': [], 'y': [], 'y_spy': [], 'w': [], 'ts': []} for b in BUCKETS}
         for row in all_rows:
             h = int(row.get('horizon_bucket') or 0)
             if h not in groups:
@@ -1379,6 +1380,7 @@ def _run_lr_training_daily(job_id: str):
                 continue
             groups[h]['X'].append(feats)
             groups[h]['y'].append(float(signed_pct))
+            groups[h]['y_spy'].append(row.get('spy_actual_pct'))
             groups[h]['w'].append(decay_w(row.get('created_at')))
             groups[h]['ts'].append(row.get('created_at'))
 
@@ -1396,49 +1398,68 @@ def _run_lr_training_daily(job_id: str):
 
             X_np = np.array(X_raw, dtype=float)
             y_np = np.array(groups[bucket]['y'], dtype=float)
+            spy_np = np.array([float(v) if v is not None else float('nan') for v in groups[bucket]['y_spy']])
             w_np = np.array(groups[bucket]['w'], dtype=float)
 
             # Walk-forward: holdout = last 30 days
             holdout_mask = np.array([_parse_ts(ts) >= holdout_cutoff for ts in groups[bucket]['ts']])
             tv_mask = ~holdout_mask
             if tv_mask.sum() >= 20:
-                X_tv, y_tv, w_tv = X_np[tv_mask], y_np[tv_mask], w_np[tv_mask]
+                X_tv, y_tv, spy_tv, w_tv = X_np[tv_mask], y_np[tv_mask], spy_np[tv_mask], w_np[tv_mask]
             else:
-                X_tv, y_tv, w_tv = X_np, y_np, w_np
+                X_tv, y_tv, spy_tv, w_tv = X_np, y_np, spy_np, w_np
+
+            # OLS beta_spy per bucket: y_total = beta * spy + idio
+            beta_spy = 0.0
+            vb = ~np.isnan(y_tv) & ~np.isnan(spy_tv)
+            if vb.sum() >= 20:
+                yb = y_tv[vb]; sb = spy_tv[vb]
+                sc = sb - sb.mean(); d = float(np.dot(sc, sc))
+                if d > 1e-10:
+                    beta_spy = float(np.clip(np.dot(yb - yb.mean(), sc) / d, 0.0, 3.0))
 
             split = max(10, int(len(X_tv) * 0.8))
             X_train, X_val = X_tv[:split], X_tv[split:]
-            y_train, y_val = y_tv[:split], y_tv[split:]
+            # Apply beta adjustment to target (train on idiosyncratic return)
+            y_train = apply_beta_adj(y_tv[:split], spy_tv[:split], beta_spy)
+            y_val   = apply_beta_adj(y_tv[split:], spy_tv[split:], beta_spy)
             w_train = w_tv[:split]
 
             scaler = StandardScaler()
             X_train_s = scaler.fit_transform(X_train)
             X_val_s = scaler.transform(X_val) if len(X_val) > 0 else np.empty((0, X_train.shape[1]))
 
+            tm = ~np.isnan(y_train)
+            if tm.sum() < 20:
+                job['models_done'] += 1
+                continue
+
             # Ridge signed — kept for backward compat
             reg = Ridge(alpha=1.0)
-            reg.fit(X_train_s, y_train, sample_weight=w_train)
-            r2_val = float(r2_score(y_train, reg.predict(X_train_s)))
+            reg.fit(X_train_s[tm], y_train[tm], sample_weight=w_train[tm])
+            r2_val = float(r2_score(y_train[tm], reg.predict(X_train_s[tm])))
             avg_mag = float(np.mean(np.abs(y_tv)))
             median_mag = float(np.median(np.abs(y_tv)))
+            vm = ~np.isnan(y_val) if len(X_val_s) > 0 else np.zeros(0, dtype=bool)
             val_mae_ridge = None
-            if len(X_val_s) > 0:
-                val_mae_ridge = float(np.mean(np.abs(y_val - reg.predict(X_val_s))))
+            if vm.sum() > 0:
+                val_mae_ridge = float(np.mean(np.abs(y_val[vm] - reg.predict(X_val_s[vm]))))
 
-            # LightGBM daily — early stopping against val set, lower lr for stability
+            # LightGBM daily — regression_l1 + early stopping
             lgbm_model_b64 = lgbm_val_mae = None
-            if len(X_train_s) >= 30:
-                eval_set_d = [(X_val_s, y_val)] if len(X_val_s) >= 5 else None
+            if tm.sum() >= 30:
+                eval_set_d = [(X_val_s[vm], y_val[vm])] if vm.sum() >= 5 else None
                 callbacks_d = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_d else None
                 lgb_reg = lgb.LGBMRegressor(
                     n_estimators=600, learning_rate=0.03, num_leaves=31,
                     min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
                     random_state=42, verbose=-1,
-                    objective='regression',
+                    objective='regression_l1',
                 )
-                lgb_reg.fit(X_train_s, y_train, sample_weight=w_train, eval_set=eval_set_d, callbacks=callbacks_d)
-                if len(X_val_s) > 0:
-                    lgbm_val_mae = float(np.mean(np.abs(y_val - lgb_reg.predict(X_val_s))))
+                lgb_reg.fit(X_train_s[tm], y_train[tm], sample_weight=w_train[tm],
+                            eval_set=eval_set_d, callbacks=callbacks_d)
+                if vm.sum() > 0:
+                    lgbm_val_mae = float(np.mean(np.abs(y_val[vm] - lgb_reg.predict(X_val_s[vm]))))
                 lgbm_model_b64 = base64.b64encode(pickle.dumps(lgb_reg)).decode('utf-8')
 
             upserts.append({
@@ -1451,14 +1472,15 @@ def _run_lr_training_daily(job_id: str):
                 'signed_r2': round(r2_val, 4),
                 'avg_actual_mag': round(avg_mag, 4),
                 'median_actual_mag': round(median_mag, 4),
-                'train_samples': len(X_tv),
+                'train_samples': int(tm.sum()),
                 'lgbm_model': lgbm_model_b64,
                 'lgbm_val_mae': lgbm_val_mae,
                 'val_mae_ridge': val_mae_ridge,
+                'beta_spy': beta_spy,
             })
             job['models_done'] += 1
             print(
-                f'[lr_train_daily] H={bucket}: n={len(X_tv)} r2={r2_val:.3f} '
+                f'[lr_train_daily] H={bucket}: n={tm.sum()} beta={beta_spy:.3f} r2={r2_val:.3f} '
                 f'val_mae_ridge={val_mae_ridge} lgbm_val_mae={lgbm_val_mae}',
                 flush=True,
             )
