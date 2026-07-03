@@ -769,7 +769,9 @@ def _run_lr_training(job_id: str):
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
         job['status'] = 'fetching'
-        resp = sb.rpc('get_intraday_training_data').limit(20000).execute()
+        # Single call with explicit range to bypass PostgREST's 1000-row default cap.
+        # SQL function already has LIMIT 20000 + 60-day filter to keep query fast.
+        resp = sb.rpc('get_intraday_training_data').range(0, 19999).execute()
         all_rows = resp.data or []
         print(f'[lr_train] fetched {len(all_rows)} rows', flush=True)
 
