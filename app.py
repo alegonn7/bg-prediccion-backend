@@ -765,6 +765,32 @@ def _run_lr_training(job_id: str):
             return datetime.fromisoformat(ts.replace('Z', '+00:00'))
         return ts if getattr(ts, 'tzinfo', None) else ts.replace(tzinfo=timezone.utc)
 
+    def _wf_mae(X, y_signed, y_spy, beta):
+        """Walk-forward MAE across 3 chronological folds using Ridge signed model."""
+        n = len(X)
+        if n < 25:
+            return None
+        min_tr = max(15, n // 4)
+        fold_sz = max(3, (n - min_tr) // 3)
+        maes = []
+        for fold in range(3):
+            t_end = min_tr + fold * fold_sz
+            v_end = min(t_end + fold_sz, n)
+            if t_end >= n or v_end - t_end < 3:
+                break
+            yt = apply_beta_adj(y_signed[:t_end], y_spy[:t_end], beta)
+            yv = apply_beta_adj(y_signed[t_end:v_end], y_spy[t_end:v_end], beta)
+            tr_m = ~np.isnan(yt); v_m = ~np.isnan(yv)
+            if tr_m.sum() < 10 or v_m.sum() < 3:
+                continue
+            sc = StandardScaler()
+            Xts = sc.fit_transform(X[:t_end][tr_m])
+            Xvs = sc.transform(X[t_end:v_end][v_m])
+            reg = Ridge(alpha=1.0)
+            reg.fit(Xts, yt[tr_m])
+            maes.append(float(np.mean(np.abs(yv[v_m] - reg.predict(Xvs)))))
+        return float(np.mean(maes)) if maes else None
+
     try:
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -854,6 +880,8 @@ def _run_lr_training(job_id: str):
                         np.dot(y_b - y_b.mean(), spy_c) / denom, 0.0, 3.0
                     ))
 
+            wf_val_mae = _wf_mae(X_tv, y_signed_tv, y_spy_tv, beta_spy)
+
             split = max(10, int(len(X_tv) * 0.8))
             X_train, X_val = X_tv[:split], X_tv[split:]
             y_dir_train = y_dir_tv[:split]
@@ -906,7 +934,7 @@ def _run_lr_training(job_id: str):
                             y_signed_val[val_sm] - reg_s.predict(X_val_s[val_sm])
                         )))
 
-            # LightGBM — train once per horizon, reuse across model_names (data is identical).
+            # LightGBM — train once per horizon with Optuna tuning, reuse across model_names.
             # Target ATR-normalized so model learns in ATR units; inference denormalizes.
             lgbm_model_b64 = lgbm_val_mae = lgbm_importance = None
             if horizon_minutes in lgbm_horizon_cache:
@@ -916,23 +944,51 @@ def _run_lr_training(job_id: str):
                 lgbm_importance = cached['importance']
                 beta_spy = cached['beta_spy']
             elif Xs is not None and len(Xs) >= 30:
+                import optuna
+                optuna.logging.set_verbosity(optuna.logging.WARNING)
+
                 atr_idx = LR_FEATURE_NAMES.index('atr_pct')
                 atr_train_raw = np.clip(X_train[train_signed_mask][:, atr_idx], 0.1, 10.0)
                 ys_norm = ys / atr_train_raw
 
                 val_sm = ~np.isnan(y_signed_val) if len(X_val_s) > 0 else np.zeros(0, dtype=bool)
-                eval_set_norm = None
-                if val_sm.sum() >= 5:
+                has_val = val_sm.sum() >= 5
+                if has_val:
                     atr_val_raw = np.clip(X_val[:, atr_idx][val_sm], 0.1, 10.0)
                     y_val_norm = y_signed_val[val_sm] / atr_val_raw
-                    eval_set_norm = [(X_val_s[val_sm], y_val_norm)]
 
+                def _lgbm_objective(trial):
+                    params = dict(
+                        num_leaves=trial.suggest_int('num_leaves', 15, 127),
+                        learning_rate=trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+                        min_child_samples=trial.suggest_int('min_child_samples', 5, 50),
+                        max_depth=trial.suggest_int('max_depth', 3, 8),
+                        subsample=trial.suggest_float('subsample', 0.6, 1.0),
+                        colsample_bytree=trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                        reg_alpha=trial.suggest_float('reg_alpha', 0.0, 1.0),
+                        reg_lambda=trial.suggest_float('reg_lambda', 0.0, 5.0),
+                        n_estimators=300, random_state=42, verbose=-1,
+                        objective='regression_l1',
+                    )
+                    m = lgb.LGBMRegressor(**params)
+                    m.fit(Xs, ys_norm, sample_weight=ws)
+                    if has_val:
+                        preds_d = m.predict(X_val_s[val_sm]) * atr_val_raw
+                        return float(np.mean(np.abs(y_signed_val[val_sm] - preds_d)))
+                    return float(np.mean(np.abs(ys_norm - m.predict(Xs))))
+
+                study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
+                n_trials = 50 if len(Xs) >= 50 else 25
+                study.optimize(_lgbm_objective, n_trials=n_trials, show_progress_bar=False)
+                best_p = study.best_params
+                print(f'[optuna] H={horizon_minutes} best={best_p} val_mae={study.best_value:.4f}', flush=True)
+
+                # Train final model with best params + early stopping
+                eval_set_norm = [(X_val_s[val_sm], y_val_norm)] if has_val else None
                 callbacks = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_norm else None
                 lgb_reg = lgb.LGBMRegressor(
-                    n_estimators=500, learning_rate=0.05, num_leaves=31,
-                    min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
-                    random_state=42, verbose=-1,
-                    objective='regression_l1',  # directly minimizes MAE
+                    **best_p, n_estimators=500, random_state=42, verbose=-1,
+                    objective='regression_l1',
                 )
                 lgb_reg.fit(Xs, ys_norm, sample_weight=ws, eval_set=eval_set_norm, callbacks=callbacks)
                 if val_sm.sum() > 0:
@@ -971,17 +1027,19 @@ def _run_lr_training(job_id: str):
                 'lgbm_feature_importance': lgbm_importance,
                 'val_mae_ridge': val_mae_ridge,
                 'beta_spy': beta_spy,
+                'wf_val_mae': wf_val_mae,
             })
             results[f'{model_name}:{horizon_minutes}'] = {
                 'samples': len(X_tv), 'accuracy': round(accuracy, 3),
                 'avg_mag': round(avg_mag, 3) if avg_mag else None,
                 'val_mae_ridge': round(val_mae_ridge, 3) if val_mae_ridge else None,
                 'lgbm_val_mae': round(lgbm_val_mae, 3) if lgbm_val_mae else None,
+                'wf_val_mae': round(wf_val_mae, 3) if wf_val_mae else None,
             }
             job['models_done'] = len(upserts)
             print(
                 f'[lr_train] {model_name}:{horizon_minutes} n={len(X_tv)} acc={accuracy:.3f} '
-                f'val_mae_ridge={val_mae_ridge} lgbm_val_mae={lgbm_val_mae}',
+                f'wf_val_mae={wf_val_mae} lgbm_val_mae={lgbm_val_mae}',
                 flush=True,
             )
 

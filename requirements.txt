@@ -7,3 +7,4 @@ supabase==2.10.0
 flask==3.1.0
 gunicorn==23.0.0
 APScheduler==3.10.4
+optuna==4.1.0
