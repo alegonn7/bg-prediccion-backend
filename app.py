@@ -807,6 +807,16 @@ def _run_lr_training(job_id: str):
         upserts = []
         results = {}
 
+        # Cache LGBM per horizon — data is identical across model_names for same horizon,
+        # so training 13 separate LGBMs wastes compute and produces identical models.
+        lgbm_horizon_cache: dict = {}  # {horizon_minutes: {model_b64, val_mae, importance, beta_spy}}
+
+        def apply_beta_adj(y_arr, spy_arr, beta):
+            out = y_arr.copy()
+            valid = ~np.isnan(spy_arr) & ~np.isnan(y_arr)
+            out[valid] -= beta * spy_arr[valid]
+            return out
+
         for (model_name, horizon_minutes), data in groups.items():
             n = len(data['X'])
             if n < 20:
@@ -841,12 +851,6 @@ def _run_lr_training(job_id: str):
                     beta_spy = float(np.clip(
                         np.dot(y_b - y_b.mean(), spy_c) / denom, 0.0, 3.0
                     ))
-
-            def apply_beta_adj(y_arr, spy_arr, beta):
-                out = y_arr.copy()
-                valid = ~np.isnan(spy_arr) & ~np.isnan(y_arr)
-                out[valid] -= beta * spy_arr[valid]
-                return out
 
             split = max(10, int(len(X_tv) * 0.8))
             X_train, X_val = X_tv[:split], X_tv[split:]
@@ -900,13 +904,17 @@ def _run_lr_training(job_id: str):
                             y_signed_val[val_sm] - reg_s.predict(X_val_s[val_sm])
                         )))
 
-            # LightGBM — target normalized by ATR so model learns in ATR units.
-            # Inference denormalizes: pred_pct = model.predict(X) * current_atr_pct.
-            # This makes predictions comparable across high/low volatility regimes.
+            # LightGBM — train once per horizon, reuse across model_names (data is identical).
+            # Target ATR-normalized so model learns in ATR units; inference denormalizes.
             lgbm_model_b64 = lgbm_val_mae = lgbm_importance = None
-            if Xs is not None and len(Xs) >= 30:
+            if horizon_minutes in lgbm_horizon_cache:
+                cached = lgbm_horizon_cache[horizon_minutes]
+                lgbm_model_b64 = cached['model_b64']
+                lgbm_val_mae = cached['val_mae']
+                lgbm_importance = cached['importance']
+                beta_spy = cached['beta_spy']
+            elif Xs is not None and len(Xs) >= 30:
                 atr_idx = LR_FEATURE_NAMES.index('atr_pct')
-                # Raw ATR for train samples (before scaling), clipped to [0.1, 10]
                 atr_train_raw = np.clip(X_train[train_signed_mask][:, atr_idx], 0.1, 10.0)
                 ys_norm = ys / atr_train_raw
 
@@ -922,7 +930,7 @@ def _run_lr_training(job_id: str):
                     n_estimators=500, learning_rate=0.05, num_leaves=31,
                     min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
                     random_state=42, verbose=-1,
-                    objective='regression',
+                    objective='regression_l1',  # directly minimizes MAE
                 )
                 lgb_reg.fit(Xs, ys_norm, sample_weight=ws, eval_set=eval_set_norm, callbacks=callbacks)
                 if val_sm.sum() > 0:
@@ -931,6 +939,12 @@ def _run_lr_training(job_id: str):
                     lgbm_val_mae = float(np.mean(np.abs(y_signed_val[val_sm] - preds_denorm)))
                 lgbm_model_b64 = base64.b64encode(pickle.dumps(lgb_reg)).decode('utf-8')
                 lgbm_importance = dict(zip(LR_FEATURE_NAMES, lgb_reg.feature_importances_.tolist()))
+                lgbm_horizon_cache[horizon_minutes] = {
+                    'model_b64': lgbm_model_b64,
+                    'val_mae': lgbm_val_mae,
+                    'importance': lgbm_importance,
+                    'beta_spy': beta_spy,
+                }
 
             upserts.append({
                 'model_name': model_name,
@@ -997,6 +1011,7 @@ def _run_lr_training(job_id: str):
 
         session_upserts = []
         atr_idx = LR_FEATURE_NAMES.index('atr_pct')
+        session_lgbm_cache: dict = {}  # {(horizon_minutes, session): cached lgbm info}
         for (model_name, horizon_minutes, session), sdata in session_groups.items():
             X_np = np.array(sdata['X'], dtype=float)
             y_np = np.array([float(v) if v is not None else float('nan') for v in sdata['y_signed']])
@@ -1049,28 +1064,45 @@ def _run_lr_training(job_id: str):
                 atr_v = np.clip(X_v[:, atr_idx][val_sm_s], 0.1, 10.0)
                 eval_set_s = [(X_v_s[val_sm_s], y_v[val_sm_s] / atr_v)]
 
-            cbs = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_s else None
-            lgb_s = lgb.LGBMRegressor(
-                n_estimators=500, learning_rate=0.05, num_leaves=31,
-                min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
-                random_state=42, verbose=-1,
-                objective='regression',
-            )
-            lgb_s.fit(Xs_s, ys_norm_s, sample_weight=ws_s, eval_set=eval_set_s, callbacks=cbs)
+            sess_cache_key = (horizon_minutes, session)
+            if sess_cache_key in session_lgbm_cache:
+                sc = session_lgbm_cache[sess_cache_key]
+                lgbm_s_b64 = sc['model_b64']
+                sess_val_mae = sc['val_mae']
+                lgbm_s_imp = sc['importance']
+                sess_beta = sc['beta_spy']
+            else:
+                cbs = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_s else None
+                lgb_s = lgb.LGBMRegressor(
+                    n_estimators=500, learning_rate=0.05, num_leaves=31,
+                    min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
+                    random_state=42, verbose=-1,
+                    objective='regression_l1',  # directly minimizes MAE
+                )
+                lgb_s.fit(Xs_s, ys_norm_s, sample_weight=ws_s, eval_set=eval_set_s, callbacks=cbs)
 
-            sess_val_mae = None
-            if val_sm_s.sum() > 0:
-                atr_v2 = np.clip(X_v[:, atr_idx][val_sm_s], 0.1, 10.0)
-                preds_d = lgb_s.predict(X_v_s[val_sm_s]) * atr_v2
-                sess_val_mae = float(np.mean(np.abs(y_v[val_sm_s] - preds_d)))
+                sess_val_mae = None
+                if val_sm_s.sum() > 0:
+                    atr_v2 = np.clip(X_v[:, atr_idx][val_sm_s], 0.1, 10.0)
+                    preds_d = lgb_s.predict(X_v_s[val_sm_s]) * atr_v2
+                    sess_val_mae = float(np.mean(np.abs(y_v[val_sm_s] - preds_d)))
+
+                lgbm_s_b64 = base64.b64encode(pickle.dumps(lgb_s)).decode('utf-8')
+                lgbm_s_imp = dict(zip(LR_FEATURE_NAMES, lgb_s.feature_importances_.tolist()))
+                session_lgbm_cache[sess_cache_key] = {
+                    'model_b64': lgbm_s_b64,
+                    'val_mae': sess_val_mae,
+                    'importance': lgbm_s_imp,
+                    'beta_spy': sess_beta,
+                }
 
             session_upserts.append({
                 'model_name': model_name,
                 'horizon_minutes': horizon_minutes,
                 'market_session': session,
-                'lgbm_model': base64.b64encode(pickle.dumps(lgb_s)).decode('utf-8'),
+                'lgbm_model': lgbm_s_b64,
                 'lgbm_val_mae': sess_val_mae,
-                'lgbm_feature_importance': dict(zip(LR_FEATURE_NAMES, lgb_s.feature_importances_.tolist())),
+                'lgbm_feature_importance': lgbm_s_imp,
                 'train_samples': int(tr_mask.sum()),
                 'last_updated': now_utc.isoformat(),
                 'beta_spy': sess_beta,
