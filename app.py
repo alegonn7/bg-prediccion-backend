@@ -769,10 +769,17 @@ def _run_lr_training(job_id: str):
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
         job['status'] = 'fetching'
-        # Single call with explicit range to bypass PostgREST's 1000-row default cap.
-        # SQL function already has LIMIT 20000 + 60-day filter to keep query fast.
-        resp = sb.rpc('get_intraday_training_data').range(0, 19999).execute()
-        all_rows = resp.data or []
+        # PostgREST caps at 1000 rows/request — paginate in 1000-row chunks.
+        # SQL function now has 60-day filter + LIMIT 20000, so each query ~700ms.
+        # 20 batches × 700ms = ~14s total (vs old 60 × 1.67s = 100s that timed out).
+        all_rows = []
+        batch_size = 1000
+        for offset in range(0, 20001, batch_size):
+            resp = sb.rpc('get_intraday_training_data').range(offset, offset + batch_size - 1).execute()
+            batch = resp.data or []
+            all_rows.extend(batch)
+            if len(batch) < batch_size:
+                break
         print(f'[lr_train] fetched {len(all_rows)} rows', flush=True)
 
         job['total_samples'] = len(all_rows)
@@ -1407,8 +1414,8 @@ def _run_lr_training_daily(job_id: str):
             beta_spy = 0.0
             vb = ~np.isnan(y_tv) & ~np.isnan(spy_tv)
             if vb.sum() >= 20:
-                yb = y_tv[vb]; sb = spy_tv[vb]
-                sc = sb - sb.mean(); d = float(np.dot(sc, sc))
+                yb = y_tv[vb]; spy_b = spy_tv[vb]
+                sc = spy_b - spy_b.mean(); d = float(np.dot(sc, sc))
                 if d > 1e-10:
                     beta_spy = float(np.clip(np.dot(yb - yb.mean(), sc) / d, 0.0, 3.0))
 
