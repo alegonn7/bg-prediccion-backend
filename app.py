@@ -723,15 +723,17 @@ def predict_status_endpoint(job_id):
 # ── LR Intraday Training ──────────────────────────────────────────────────────
 
 LR_FEATURE_NAMES = [
+    # Core scores (score_divergencias dropped: avg importance 7 vs 227 for top features)
     'score_tendencia', 'score_momentum', 'score_volatilidad', 'score_volumen',
     'score_estructura', 'score_velas', 'score_regresion', 'score_reversion',
-    'score_divergencias', 'score_beta_mercado', 'score_vwap', 'score_apertura', 'score_horario',
+    'score_beta_mercado', 'score_vwap', 'score_apertura', 'score_horario',
+    # Technical indicators
     'rsi_7', 'price_vs_vwap', 'bb_pct_b', 'volume_ratio',
-    'momentum_15m', 'momentum_30m', 'momentum_60m', 'atr_pct', 'minutes_since_open',
-    # Phase 2: market-context features
-    'spy_return_15m', 'spy_return_session', 'premarket_gap', 'prev_day_return',
-    # Phase 3: session timing
-    'minutes_to_close',
+    'momentum_15m', 'momentum_30m', 'momentum_60m', 'atr_pct',
+    # Timing
+    'minutes_since_open', 'minutes_to_close',
+    # Phase 2 features re-added once >=200 live samples with non-null values exist
+    # 'spy_return_15m', 'spy_return_session', 'premarket_gap', 'prev_day_return',
 ]
 
 lr_training_jobs: dict = {}
