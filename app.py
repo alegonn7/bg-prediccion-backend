@@ -900,7 +900,7 @@ def _run_lr_training(job_id: str):
                     n_estimators=500, learning_rate=0.05, num_leaves=31,
                     min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
                     random_state=42, verbose=-1,
-                    objective='quantile', alpha=0.5,
+                    objective='regression',
                 )
                 lgb_reg.fit(Xs, ys_norm, sample_weight=ws, eval_set=eval_set_norm, callbacks=callbacks)
                 if val_sm.sum() > 0:
@@ -1259,7 +1259,7 @@ def _run_lr_training_daily(job_id: str):
                     n_estimators=600, learning_rate=0.03, num_leaves=31,
                     min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
                     random_state=42, verbose=-1,
-                    objective='quantile', alpha=0.5,
+                    objective='regression',
                 )
                 lgb_reg.fit(X_train_s, y_train, sample_weight=w_train, eval_set=eval_set_d, callbacks=callbacks_d)
                 if len(X_val_s) > 0:
