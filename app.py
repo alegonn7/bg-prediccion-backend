@@ -738,6 +738,47 @@ LR_FEATURE_NAMES = [
 
 lr_training_jobs: dict = {}
 
+TICKER_CLUSTERS: dict = {
+    # high_beta: speculative/volatile growth — momentum-driven
+    'NVDA': 'high_beta', 'TSLA': 'high_beta', 'AMD': 'high_beta',
+    'META': 'high_beta', 'SMCI': 'high_beta', 'COIN': 'high_beta',
+    'MSTR': 'high_beta', 'PLTR': 'high_beta', 'AFRM': 'high_beta',
+    'HOOD': 'high_beta', 'SOFI': 'high_beta', 'SQ': 'high_beta',
+    'IONQ': 'high_beta', 'RGTI': 'high_beta', 'RKLB': 'high_beta',
+    'LUNR': 'high_beta', 'RXRX': 'high_beta', 'BEAM': 'high_beta',
+    'SNAP': 'high_beta', 'PLUG': 'high_beta', 'CRWD': 'high_beta',
+    'FSLR': 'high_beta', 'ARM': 'high_beta',
+    # mega_tech: large-cap tech + semiconductor
+    'AAPL': 'mega_tech', 'MSFT': 'mega_tech', 'GOOGL': 'mega_tech',
+    'AMZN': 'mega_tech', 'NFLX': 'mega_tech', 'AVGO': 'mega_tech',
+    'ORCL': 'mega_tech', 'MRVL': 'mega_tech', 'ADBE': 'mega_tech',
+    'CRM': 'mega_tech',  'QCOM': 'mega_tech', 'INTC': 'mega_tech',
+    'IBM': 'mega_tech',  'TXN': 'mega_tech',  'CSCO': 'mega_tech',
+    'UBER': 'mega_tech', 'PYPL': 'mega_tech', 'LLY': 'mega_tech',
+    'MELI': 'mega_tech',
+    # financials: banks + payment networks
+    'JPM': 'financials', 'BAC': 'financials', 'GS': 'financials',
+    'MS': 'financials',  'WFC': 'financials', 'AXP': 'financials',
+    'MA': 'financials',  'V': 'financials',   'BLK': 'financials',
+    'GGAL': 'financials',
+    # defensive: healthcare, consumer, industrial, energy
+    'ABBV': 'defensive', 'AMGN': 'defensive', 'MRK': 'defensive',
+    'PFE': 'defensive',  'JNJ': 'defensive',  'TMO': 'defensive',
+    'UNH': 'defensive',  'KO': 'defensive',   'PEP': 'defensive',
+    'WMT': 'defensive',  'COST': 'defensive', 'MCD': 'defensive',
+    'SBUX': 'defensive', 'HD': 'defensive',   'PG': 'defensive',
+    'NKE': 'defensive',  'BA': 'defensive',   'CAT': 'defensive',
+    'GE': 'defensive',   'HON': 'defensive',  'RTX': 'defensive',
+    'LMT': 'defensive',  'UPS': 'defensive',  'ETN': 'defensive',
+    'XOM': 'defensive',  'CVX': 'defensive',  'COP': 'defensive',
+    'OXY': 'defensive',  'BRK-B': 'defensive', 'YPF': 'defensive',
+    # macro_etf: ETFs and cross-asset benchmarks
+    'SPY': 'macro_etf', 'QQQ': 'macro_etf', 'IWM': 'macro_etf',
+    'DIA': 'macro_etf', 'GLD': 'macro_etf', 'GDX': 'macro_etf',
+    'EEM': 'macro_etf', 'TLT': 'macro_etf', 'IEF': 'macro_etf',
+    'HYG': 'macro_etf', 'USO': 'macro_etf',
+}
+
 
 def apply_beta_adj(y_arr, spy_arr, beta):
     out = y_arr.copy()
@@ -1333,6 +1374,111 @@ def _run_lr_training(job_id: str):
                 tu, on_conflict='ticker,horizon_minutes'
             ).execute()
         print(f'[lr_train] ticker models: {len(ticker_upserts)} trained', flush=True)
+
+        # ── Step 9: Cluster LGBM models ───────────────────────────────────────
+        # Aggregate rows by (cluster_name, horizon_minutes); deduplicate by (ticker, created_at)
+        # so each prediction timestamp counts once per ticker, not 13× per model_name.
+        cluster_data: dict = {}
+        for row in all_rows:
+            t = row.get('ticker', '')
+            cluster = TICKER_CLUSTERS.get(t)
+            if not cluster:
+                continue
+            h = int(row['horizon_minutes'])
+            ck = (cluster, h)
+            if ck not in cluster_data:
+                cluster_data[ck] = {'X': [], 'y_signed': [], 'y_spy': [], 'w': [], 'ts': [], 'seen': set()}
+            dedup = f"{t}:{row.get('created_at', '')}"
+            if dedup in cluster_data[ck]['seen']:
+                continue
+            cluster_data[ck]['seen'].add(dedup)
+            cluster_data[ck]['X'].append([float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES])
+            cluster_data[ck]['y_signed'].append(row.get('actual_signed_pct'))
+            cluster_data[ck]['y_spy'].append(row.get('spy_actual_pct'))
+            cluster_data[ck]['w'].append(decay_w(row.get('created_at')))
+            cluster_data[ck]['ts'].append(row.get('created_at'))
+
+        cluster_upserts = []
+        cluster_lgbm_cache: dict = {}
+        for (cluster_name, horizon_minutes), cdata in cluster_data.items():
+            n = len(cdata['X'])
+            if n < 50:
+                continue
+            X_np = np.array(cdata['X'], dtype=float)
+            y_np = np.array([float(v) if v is not None else float('nan') for v in cdata['y_signed']])
+            spy_np = np.array([float(v) if v is not None else float('nan') for v in cdata['y_spy']])
+            w_np = np.array(cdata['w'], dtype=float)
+
+            holdout_mask = np.array([_parse_ts(ts) >= holdout_cutoff for ts in cdata['ts']])
+            tv_mask = ~holdout_mask
+            if tv_mask.sum() < 20:
+                tv_mask = np.ones(n, dtype=bool)
+            X_tv = X_np[tv_mask]; y_tv = y_np[tv_mask]
+            spy_tv = spy_np[tv_mask]; w_tv = w_np[tv_mask]
+
+            # OLS beta per cluster
+            c_beta = 0.0
+            vb = ~np.isnan(y_tv) & ~np.isnan(spy_tv)
+            if vb.sum() >= 20:
+                yb = y_tv[vb]; sb2 = spy_tv[vb]
+                sc2 = sb2 - sb2.mean(); d2 = float(np.dot(sc2, sc2))
+                if d2 > 1e-10:
+                    c_beta = float(np.clip(np.dot(yb - yb.mean(), sc2) / d2, 0.0, 3.0))
+
+            split = max(10, int(len(X_tv) * 0.8))
+            X_tr, X_v = X_tv[:split], X_tv[split:]
+            y_tr = apply_beta_adj(y_tv[:split], spy_tv[:split], c_beta)
+            y_v  = apply_beta_adj(y_tv[split:], spy_tv[split:], c_beta)
+            w_tr = w_tv[:split]
+
+            tm = ~np.isnan(y_tr)
+            if tm.sum() < 20:
+                continue
+
+            sc_c = StandardScaler()
+            Xs_c = sc_c.fit_transform(X_tr[tm])
+            ys_c = y_tr[tm]; ws_c = w_tr[tm]
+            atr_c = np.clip(X_tr[tm][:, atr_idx], 0.1, 10.0)
+            ys_cn = ys_c / atr_c
+
+            X_v_c = sc_c.transform(X_v) if len(X_v) > 0 else np.empty((0, X_tr.shape[1]))
+            vm_c = ~np.isnan(y_v) if len(X_v) > 0 else np.zeros(0, dtype=bool)
+            eval_c = None
+            if vm_c.sum() >= 5:
+                atr_vc = np.clip(X_v[:, atr_idx][vm_c], 0.1, 10.0)
+                eval_c = [(X_v_c[vm_c], y_v[vm_c] / atr_vc)]
+
+            cbs_c = [lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)] if eval_c else None
+            lgb_c = lgb.LGBMRegressor(
+                n_estimators=400, learning_rate=0.05, num_leaves=31,
+                min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
+                random_state=42, verbose=-1, objective='regression_l1',
+            )
+            lgb_c.fit(Xs_c, ys_cn, sample_weight=ws_c, eval_set=eval_c, callbacks=cbs_c)
+
+            c_val_mae = None
+            if vm_c.sum() > 0:
+                atr_vc2 = np.clip(X_v[:, atr_idx][vm_c], 0.1, 10.0)
+                preds_c = lgb_c.predict(X_v_c[vm_c]) * atr_vc2
+                c_val_mae = float(np.mean(np.abs(y_v[vm_c] - preds_c)))
+
+            cluster_upserts.append({
+                'cluster_name': cluster_name,
+                'horizon_minutes': horizon_minutes,
+                'lgbm_model': base64.b64encode(pickle.dumps(lgb_c)).decode('utf-8'),
+                'lgbm_val_mae': c_val_mae,
+                'beta_spy': c_beta,
+                'train_samples': int(tm.sum()),
+                'lgbm_feature_importance': dict(zip(LR_FEATURE_NAMES, lgb_c.feature_importances_.tolist())),
+                'last_updated': now_utc.isoformat(),
+            })
+            print(f'[lr_train:cluster] {cluster_name}:{horizon_minutes} n={tm.sum()} val_mae={c_val_mae} beta={c_beta:.3f}', flush=True)
+
+        for cu in cluster_upserts:
+            sb.table('lgbm_cluster_models_intraday').upsert(
+                cu, on_conflict='cluster_name,horizon_minutes'
+            ).execute()
+        print(f'[lr_train] cluster models: {len(cluster_upserts)} trained', flush=True)
         # ─────────────────────────────────────────────────────────────────────
 
         job['status'] = 'done'
@@ -1683,6 +1829,9 @@ _lgbm_session_cache_ts: float = 0.0
 _lgbm_ticker_cache: dict = {}
 _lgbm_ticker_cache_ts: float = 0.0
 
+_lgbm_cluster_cache: dict = {}
+_lgbm_cluster_cache_ts: float = 0.0
+
 
 def _load_lgbm_models_cached():
     """Returns dict[key] = (model, beta_spy). beta_spy=0 for old models without it."""
@@ -1759,6 +1908,31 @@ def _load_lgbm_ticker_models_cached():
     return _lgbm_ticker_cache
 
 
+def _load_lgbm_cluster_models_cached():
+    """Per-cluster LGBM models. Keys: 'cluster_name:horizon'. Values: (model, beta_spy)."""
+    global _lgbm_cluster_cache, _lgbm_cluster_cache_ts
+    if time.time() - _lgbm_cluster_cache_ts < 600 and _lgbm_cluster_cache:
+        return _lgbm_cluster_cache
+    from supabase import create_client
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    resp = sb.table('lgbm_cluster_models_intraday').select(
+        'cluster_name,horizon_minutes,lgbm_model,beta_spy'
+    ).execute()
+    new_cache: dict = {}
+    for row in resp.data or []:
+        if row.get('lgbm_model'):
+            key = f"{row['cluster_name']}:{row['horizon_minutes']}"
+            try:
+                model = pickle.loads(base64.b64decode(row['lgbm_model']))
+                beta = float(row.get('beta_spy') or 0.0)
+                new_cache[key] = (model, beta)
+            except Exception:
+                pass
+    _lgbm_cluster_cache = new_cache
+    _lgbm_cluster_cache_ts = time.time()
+    return _lgbm_cluster_cache
+
+
 def _get_market_session(minutes_since_open: float) -> str:
     if minutes_since_open < 30:  return 'open'
     if minutes_since_open < 120: return 'morning'
@@ -1817,17 +1991,23 @@ def predict_lgbm_all():
         spy_r15 = float(indicators.get('spy_return_15m') or 0)
         session_models = _load_lgbm_session_models_cached()
         ticker_models = _load_lgbm_ticker_models_cached()
+        cluster_models = _load_lgbm_cluster_models_cached()
         mso = float(indicators.get('minutes_since_open') or 0)
         session = _get_market_session(mso)
-        ticker_used = 0
+        cluster = TICKER_CLUSTERS.get(ticker, '') if ticker else ''
+        ticker_used = cluster_used = 0
         predictions = {}
         for key, (global_m, global_beta) in models.items():
-            # Priority: ticker model > session model > global model
+            # Priority: ticker > cluster > session > global
             horizon = key.split(':')[1]
             t_key = f'{ticker}:{horizon}' if ticker else None
+            c_key = f'{cluster}:{horizon}' if cluster else None
             if t_key and t_key in ticker_models:
                 m, beta = ticker_models[t_key]
                 ticker_used += 1
+            elif c_key and c_key in cluster_models:
+                m, beta = cluster_models[c_key]
+                cluster_used += 1
             else:
                 sess_key = f'{key}:{session}'
                 sess_entry = session_models.get(sess_key)
@@ -1842,6 +2022,7 @@ def predict_lgbm_all():
             'models_loaded': len(models),
             'session': session,
             'ticker_models_used': ticker_used,
+            'cluster_models_used': cluster_used,
             'session_models_used': sum(1 for k in models if f'{k}:{session}' in session_models),
         })
     except Exception as e:
