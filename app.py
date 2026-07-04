@@ -1558,12 +1558,26 @@ def lr_train_status(job_id):
 # ── Daily signed Ridge training ───────────────────────────────────────────────
 
 DAILY_FEATURE_NAMES = [
+    # Price vs moving averages
     'price_vs_sma20', 'price_vs_sma50', 'price_vs_sma200',
-    'rsi_norm', 'macd_norm', 'bb_pct_b_norm', 'bb_squeeze',
-    'atr_pct_norm', 'hist_vol_norm', 'adx_norm',
-    'roc_5_norm', 'roc_10_norm', 'roc_20_norm',
+    # Oscillators
+    'rsi_norm', 'macd_norm', 'stoch_rsi_norm',
+    # Volatility / bands
+    'bb_pct_b_norm', 'bb_squeeze', 'atr_pct_norm', 'hist_vol_norm',
+    # Trend strength
+    'adx_norm', 'roc_5_norm', 'roc_10_norm', 'roc_20_norm',
+    # Structure levels
+    'dist_to_support_norm', 'dist_to_resistance_norm',
+    # Volume / candle
     'candle_signal', 'obv_trend',
+    # Macro context (100% fill in indicators table)
+    'vix_norm', 'sp500_trend_enc', 'sp500_rsi_norm',
+    # Pre-computed XGB scores (100% fill)
+    'score_macro', 'score_fundamental', 'score_sentimiento',
+    # Seasonality
     'month_sin', 'month_cos',
+    # Earnings proximity (44% fill — COALESCE to 0 for missing)
+    'earnings_days_norm',
 ]
 
 
@@ -1572,8 +1586,9 @@ def _extract_daily_features(row: dict) -> list:
     vs20  = float(row.get('price_vs_sma20',  0) or 0)
     vs50  = float(row.get('price_vs_sma50',  0) or 0)
     vs200 = float(row.get('price_vs_sma200', 0) or 0)
-    rsi   = float(row.get('rsi_14', 50) or 50)
-    macdH = float(row.get('macd_histogram', 0) or 0)
+    rsi      = float(row.get('rsi_14', 50) or 50)
+    macdH    = float(row.get('macd_histogram', 0) or 0)
+    stochrsi = float(row.get('stoch_rsi', 50) or 50)
     bbB   = float(row.get('bb_pct_b', 0.5) or 0.5)
     bbs   = 1.0 if row.get('bb_squeeze') else 0.0
     atrP  = float(row.get('atr_pct', 1) or 1)
@@ -1582,23 +1597,42 @@ def _extract_daily_features(row: dict) -> list:
     roc5  = float(row.get('roc_5',  0) or 0)
     roc10 = float(row.get('roc_10', 0) or 0)
     roc20 = float(row.get('roc_20', 0) or 0)
+    dist_sup = float(row.get('dist_to_support_pct',  5) or 5)
+    dist_res = float(row.get('dist_to_resistance_pct', 5) or 5)
     cand_s = (row.get('candle_signal') or 'neutral').lower()
     cand  = 1.0 if cand_s == 'bullish' else (-1.0 if cand_s == 'bearish' else 0.0)
     obv_s = (row.get('obv_trend') or 'flat').lower()
     obv   = 1.0 if obv_s == 'rising' else (-1.0 if obv_s == 'falling' else 0.0)
-    month = int(row.get('created_month') or 1)
+    vix      = float(row.get('vix_level', 20) or 20)
+    sp500_t  = (row.get('sp500_trend') or 'neutral').lower()
+    sp500_enc = 1.0 if sp500_t == 'bullish' else (-1.0 if sp500_t == 'bearish' else 0.0)
+    sp500_rsi = float(row.get('sp500_rsi', 50) or 50)
+    sc_macro = float(row.get('score_macro', 0) or 0)
+    sc_fund  = float(row.get('score_fundamental', 0) or 0)
+    sc_sent  = float(row.get('score_sentimiento', 0) or 0)
+    month    = int(row.get('created_month') or 1)
+    earn_raw = row.get('next_earnings_days')
+    earn_norm = cl3(float(earn_raw) / 30) if earn_raw is not None else 0.0
     return [
         cl3(vs20 / 5), cl3(vs50 / 10), cl3(vs200 / 20),
         (rsi - 50) / 25,
         cl3(macdH / (abs(macdH) + 0.01)),
+        (stochrsi - 50) / 50,
         bbB * 2 - 1, bbs,
         cl3(atrP / 3, 0.0, 3.0),
         cl3(hv / 50, 0.0, 3.0),
         cl3(adx / 50 - 0.4),
         cl3(roc5 / 5), cl3(roc10 / 10), cl3(roc20 / 20),
+        cl3(dist_sup / 5, 0.0, 3.0),
+        cl3(dist_res / 5, 0.0, 3.0),
         cand, obv,
+        cl3((vix - 20) / 10),
+        sp500_enc,
+        (sp500_rsi - 50) / 25,
+        cl3(sc_macro), cl3(sc_fund), cl3(sc_sent),
         math.sin(2 * math.pi * month / 12),
         math.cos(2 * math.pi * month / 12),
+        earn_norm,
     ]
 
 
@@ -1648,12 +1682,18 @@ def _run_lr_training_daily(job_id: str):
 
         BUCKETS = [7, 14, 30, 60, 90]
         groups: dict = {b: {'X': [], 'y': [], 'y_spy': [], 'w': [], 'ts': []} for b in BUCKETS}
+        earnings_filtered = 0
         for row in all_rows:
             h = int(row.get('horizon_bucket') or 0)
             if h not in groups:
                 continue
             signed_pct = row.get('actual_signed_pct')
             if signed_pct is None:
+                continue
+            # Paso B: earnings filter — skip rows within ±3 days of earnings
+            earn_days = row.get('next_earnings_days')
+            if earn_days is not None and abs(int(earn_days)) <= 3:
+                earnings_filtered += 1
                 continue
             feats = _extract_daily_features(row)
             if len(feats) != len(DAILY_FEATURE_NAMES):
@@ -1663,6 +1703,7 @@ def _run_lr_training_daily(job_id: str):
             groups[h]['y_spy'].append(row.get('spy_actual_pct'))
             groups[h]['w'].append(decay_w(row.get('created_at')))
             groups[h]['ts'].append(row.get('created_at'))
+        print(f'[lr_train_daily] earnings filter removed {earnings_filtered} rows', flush=True)
 
         job['status'] = 'training'
         job['models_total'] = len(BUCKETS)
@@ -1690,13 +1731,14 @@ def _run_lr_training_daily(job_id: str):
                 X_tv, y_tv, spy_tv, w_tv = X_np, y_np, spy_np, w_np
 
             # OLS beta_spy per bucket: y_total = beta * spy + idio
+            # Paso E: allow negative beta (defensive stocks have beta < 0 legitimately)
             beta_spy = 0.0
             vb = ~np.isnan(y_tv) & ~np.isnan(spy_tv)
             if vb.sum() >= 20:
                 yb = y_tv[vb]; spy_b = spy_tv[vb]
                 sc = spy_b - spy_b.mean(); d = float(np.dot(sc, sc))
                 if d > 1e-10:
-                    beta_spy = float(np.clip(np.dot(yb - yb.mean(), sc) / d, 0.0, 3.0))
+                    beta_spy = float(np.clip(np.dot(yb - yb.mean(), sc) / d, -0.5, 3.0))
 
             split = max(10, int(len(X_tv) * 0.8))
             X_train, X_val = X_tv[:split], X_tv[split:]
@@ -1725,15 +1767,44 @@ def _run_lr_training_daily(job_id: str):
             if vm.sum() > 0:
                 val_mae_ridge = float(np.mean(np.abs(y_val[vm] - reg.predict(X_val_s[vm]))))
 
-            # LightGBM daily — regression_l1 + early stopping
+            # Paso C: LightGBM daily — Optuna-tuned hyperparams + early stopping
             lgbm_model_b64 = lgbm_val_mae = None
             if tm.sum() >= 30:
-                eval_set_d = [(X_val_s[vm], y_val[vm])] if vm.sum() >= 5 else None
+                import optuna as _optuna
+                _optuna.logging.set_verbosity(_optuna.logging.WARNING)
+                has_val_d = vm.sum() >= 5
+
+                def _lgbm_daily_obj(trial):
+                    p = dict(
+                        num_leaves=trial.suggest_int('num_leaves', 15, 127),
+                        learning_rate=trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+                        min_child_samples=trial.suggest_int('min_child_samples', 5, 50),
+                        max_depth=trial.suggest_int('max_depth', 3, 8),
+                        subsample=trial.suggest_float('subsample', 0.6, 1.0),
+                        colsample_bytree=trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                        reg_alpha=trial.suggest_float('reg_alpha', 0.0, 1.0),
+                        reg_lambda=trial.suggest_float('reg_lambda', 0.0, 5.0),
+                        n_estimators=300, random_state=42, verbose=-1,
+                        objective='regression_l1',
+                    )
+                    m = lgb.LGBMRegressor(**p)
+                    m.fit(X_train_s[tm], y_train[tm], sample_weight=w_train[tm])
+                    if has_val_d:
+                        return float(np.mean(np.abs(y_val[vm] - m.predict(X_val_s[vm]))))
+                    return float(np.mean(np.abs(y_train[tm] - m.predict(X_train_s[tm]))))
+
+                _study_d = _optuna.create_study(
+                    direction='minimize', sampler=_optuna.samplers.TPESampler(seed=42)
+                )
+                _n_trials_d = 50 if int(tm.sum()) >= 30 else 25
+                _study_d.optimize(_lgbm_daily_obj, n_trials=_n_trials_d, show_progress_bar=False)
+                best_p_d = _study_d.best_params
+                print(f'[optuna_daily] H={bucket} best={best_p_d} val_mae={_study_d.best_value:.4f}', flush=True)
+
+                eval_set_d = [(X_val_s[vm], y_val[vm])] if has_val_d else None
                 callbacks_d = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_d else None
                 lgb_reg = lgb.LGBMRegressor(
-                    n_estimators=600, learning_rate=0.03, num_leaves=31,
-                    min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
-                    random_state=42, verbose=-1,
+                    **best_p_d, n_estimators=600, random_state=42, verbose=-1,
                     objective='regression_l1',
                 )
                 lgb_reg.fit(X_train_s[tm], y_train[tm], sample_weight=w_train[tm],
