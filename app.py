@@ -734,6 +734,10 @@ LR_FEATURE_NAMES = [
     'minutes_since_open', 'minutes_to_close',
     # SPY context + session setup (activated: >500 live samples as of 2026-07-03)
     'spy_return_15m', 'premarket_gap', 'prev_day_return',
+    # spy_return_session: COALESCE to 0 — zero-variance until ~3 weeks post calculador fix (2026-07-03)
+    'spy_return_session',
+    # peer_momentum_15m: avg momentum_15m of cluster peers (5-min lag) — zero-variance until calculador v10
+    'peer_momentum_15m',
 ]
 
 lr_training_jobs: dict = {}
@@ -1077,7 +1081,7 @@ def _run_lr_training(job_id: str):
                     return float(np.mean(np.abs(ys_norm - m.predict(Xs))))
 
                 study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
-                n_trials = 50 if len(Xs) >= 50 else 25
+                n_trials = 50 if len(Xs) >= 30 else 25
                 study.optimize(_lgbm_objective, n_trials=n_trials, show_progress_bar=False)
                 best_p = study.best_params
                 print(f'[optuna] H={horizon_minutes} best={best_p} val_mae={study.best_value:.4f}', flush=True)
@@ -1884,14 +1888,14 @@ def _load_lgbm_session_models_cached():
 
 
 def _load_lgbm_ticker_models_cached():
-    """Per-ticker LGBM models. Keys: 'TICKER:horizon'. Values: (model, beta_spy)."""
+    """Per-ticker LGBM models. Keys: 'TICKER:horizon'. Values: (model, beta_spy, train_samples)."""
     global _lgbm_ticker_cache, _lgbm_ticker_cache_ts
     if time.time() - _lgbm_ticker_cache_ts < 600 and _lgbm_ticker_cache:
         return _lgbm_ticker_cache
     from supabase import create_client
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     resp = sb.table('lgbm_ticker_models_intraday').select(
-        'ticker,horizon_minutes,lgbm_model,beta_spy'
+        'ticker,horizon_minutes,lgbm_model,beta_spy,train_samples'
     ).execute()
     new_cache: dict = {}
     for row in resp.data or []:
@@ -1900,7 +1904,8 @@ def _load_lgbm_ticker_models_cached():
             try:
                 model = pickle.loads(base64.b64decode(row['lgbm_model']))
                 beta = float(row.get('beta_spy') or 0.0)
-                new_cache[key] = (model, beta)
+                n_samples = int(row.get('train_samples') or 0)
+                new_cache[key] = (model, beta, n_samples)
             except Exception:
                 pass
     _lgbm_ticker_cache = new_cache
@@ -1998,13 +2003,24 @@ def predict_lgbm_all():
         ticker_used = cluster_used = 0
         predictions = {}
         for key, (global_m, global_beta) in models.items():
-            # Priority: ticker > cluster > session > global
+            # Priority: ticker (blended w/ cluster if data-starved) > cluster > session > global
             horizon = key.split(':')[1]
             t_key = f'{ticker}:{horizon}' if ticker else None
             c_key = f'{cluster}:{horizon}' if cluster else None
+            blended = False
             if t_key and t_key in ticker_models:
-                m, beta = ticker_models[t_key]
+                t_model, t_beta, t_n = ticker_models[t_key]
                 ticker_used += 1
+                if c_key and c_key in cluster_models and t_n < 200:
+                    # Continuous blend: weight ticker by its sample richness
+                    c_model, c_beta = cluster_models[c_key]
+                    w_t = t_n / 200.0
+                    pred_t = float(t_model.predict(X)[0]) * atr_scale + t_beta * spy_r15
+                    pred_c = float(c_model.predict(X)[0]) * atr_scale + c_beta * spy_r15
+                    predictions[key] = round(w_t * pred_t + (1.0 - w_t) * pred_c, 4)
+                    blended = True
+                else:
+                    m, beta = t_model, t_beta
             elif c_key and c_key in cluster_models:
                 m, beta = cluster_models[c_key]
                 cluster_used += 1
@@ -2015,8 +2031,9 @@ def predict_lgbm_all():
                     m, beta = sess_entry
                 else:
                     m, beta = global_m, global_beta
-            pred_idio = float(m.predict(X)[0]) * atr_scale
-            predictions[key] = round(pred_idio + beta * spy_r15, 4)
+            if not blended:
+                pred_idio = float(m.predict(X)[0]) * atr_scale
+                predictions[key] = round(pred_idio + beta * spy_r15, 4)
         return jsonify({
             'ok': True, 'predictions': predictions,
             'models_loaded': len(models),
