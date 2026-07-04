@@ -1558,81 +1558,138 @@ def lr_train_status(job_id):
 # ── Daily signed Ridge training ───────────────────────────────────────────────
 
 DAILY_FEATURE_NAMES = [
-    # Price vs moving averages
+    # Price vs moving averages (3)
     'price_vs_sma20', 'price_vs_sma50', 'price_vs_sma200',
-    # Oscillators
+    # Oscillators (6)
     'rsi_norm', 'macd_norm', 'stoch_rsi_norm',
-    # Volatility / bands
+    'mfi_norm', 'cci_norm', 'williams_norm',
+    # Volatility / bands (4)
     'bb_pct_b_norm', 'bb_squeeze', 'atr_pct_norm', 'hist_vol_norm',
-    # Trend strength
+    # Long-window volatility (1)
+    'hist_vol_60_norm',
+    # Trend strength (4)
     'adx_norm', 'roc_5_norm', 'roc_10_norm', 'roc_20_norm',
-    # Structure levels
+    # Structure levels (2)
     'dist_to_support_norm', 'dist_to_resistance_norm',
-    # Volume / candle
+    # Volume / candle (5)
+    'volume_ratio_norm', 'cmf_norm', 'stoch_k_norm',
     'candle_signal', 'obv_trend',
-    # Macro context (100% fill in indicators table)
+    # Market correlation (1)
+    'market_corr_norm',
+    # Macro context (3)
     'vix_norm', 'sp500_trend_enc', 'sp500_rsi_norm',
-    # Pre-computed XGB scores (100% fill)
+    # Pre-computed XGB scores (5)
     'score_macro', 'score_fundamental', 'score_sentimiento',
-    # Seasonality
+    'score_tendencia', 'score_momentum',
+    # Seasonality (2)
     'month_sin', 'month_cos',
-    # Earnings proximity (44% fill — COALESCE to 0 for missing)
+    # Earnings proximity (1)
     'earnings_days_norm',
+    # VIX regime interactions (3) — derived, no extra SQL needed
+    'vix_x_rsi', 'vix_x_momentum', 'vix_x_score_macro',
 ]
 
 
 def _extract_daily_features(row: dict) -> list:
     def cl3(v, lo=-3.0, hi=3.0): return max(lo, min(hi, float(v)))
+    # Price vs MA
     vs20  = float(row.get('price_vs_sma20',  0) or 0)
     vs50  = float(row.get('price_vs_sma50',  0) or 0)
     vs200 = float(row.get('price_vs_sma200', 0) or 0)
+    # Oscillators
     rsi      = float(row.get('rsi_14', 50) or 50)
     macdH    = float(row.get('macd_histogram', 0) or 0)
     stochrsi = float(row.get('stoch_rsi', 50) or 50)
+    mfi      = float(row.get('mfi_14', 50) or 50)
+    cci      = float(row.get('cci_20', 0) or 0)
+    willr    = float(row.get('williams_r_14', -50) or -50)
+    # Volatility
     bbB   = float(row.get('bb_pct_b', 0.5) or 0.5)
     bbs   = 1.0 if row.get('bb_squeeze') else 0.0
     atrP  = float(row.get('atr_pct', 1) or 1)
     hv    = float(row.get('hist_vol_20', 20) or 20)
+    hv60  = float(row.get('hist_vol_60', 20) or 20)
+    # Trend
     adx   = float(row.get('adx_14', 20) or 20)
     roc5  = float(row.get('roc_5',  0) or 0)
     roc10 = float(row.get('roc_10', 0) or 0)
     roc20 = float(row.get('roc_20', 0) or 0)
+    # Structure
     dist_sup = float(row.get('dist_to_support_pct',  5) or 5)
     dist_res = float(row.get('dist_to_resistance_pct', 5) or 5)
+    # Volume / candle
+    vol_r  = float(row.get('volume_ratio', 1) or 1)
+    cmf    = float(row.get('cmf_20', 0) or 0)
+    stoch_k = float(row.get('stoch_k', 50) or 50)
     cand_s = (row.get('candle_signal') or 'neutral').lower()
     cand  = 1.0 if cand_s == 'bullish' else (-1.0 if cand_s == 'bearish' else 0.0)
     obv_s = (row.get('obv_trend') or 'flat').lower()
     obv   = 1.0 if obv_s == 'rising' else (-1.0 if obv_s == 'falling' else 0.0)
+    # Market correlation
+    mcorr = float(row.get('market_corr_60d', 0) or 0)
+    # Macro
     vix      = float(row.get('vix_level', 20) or 20)
     sp500_t  = (row.get('sp500_trend') or 'neutral').lower()
     sp500_enc = 1.0 if sp500_t == 'bullish' else (-1.0 if sp500_t == 'bearish' else 0.0)
     sp500_rsi = float(row.get('sp500_rsi', 50) or 50)
+    # XGB scores
     sc_macro = float(row.get('score_macro', 0) or 0)
     sc_fund  = float(row.get('score_fundamental', 0) or 0)
     sc_sent  = float(row.get('score_sentimiento', 0) or 0)
+    sc_tend  = float(row.get('score_tendencia', 0) or 0)
+    sc_mom   = float(row.get('score_momentum', 0) or 0)
     month    = int(row.get('created_month') or 1)
     earn_raw = row.get('next_earnings_days')
     earn_norm = cl3(float(earn_raw) / 30) if earn_raw is not None else 0.0
+    # Derived normalized scalars for interactions
+    vix_n    = cl3((vix - 20) / 10)
+    rsi_n    = (rsi - 50) / 25
+    roc20_n  = cl3(roc20 / 20)
+    sc_macro_n = cl3(sc_macro)
     return [
+        # Price vs MA (3)
         cl3(vs20 / 5), cl3(vs50 / 10), cl3(vs200 / 20),
-        (rsi - 50) / 25,
+        # Oscillators (6)
+        rsi_n,
         cl3(macdH / (abs(macdH) + 0.01)),
         (stochrsi - 50) / 50,
+        (mfi - 50) / 25,
+        cl3(cci / 100),
+        (willr + 50) / 25,
+        # Volatility (4)
         bbB * 2 - 1, bbs,
         cl3(atrP / 3, 0.0, 3.0),
         cl3(hv / 50, 0.0, 3.0),
+        # Long vol (1)
+        cl3(hv60 / 60, 0.0, 3.0),
+        # Trend (4)
         cl3(adx / 50 - 0.4),
-        cl3(roc5 / 5), cl3(roc10 / 10), cl3(roc20 / 20),
+        cl3(roc5 / 5), cl3(roc10 / 10), roc20_n,
+        # Structure (2)
         cl3(dist_sup / 5, 0.0, 3.0),
         cl3(dist_res / 5, 0.0, 3.0),
+        # Volume / candle (5)
+        cl3(vol_r / 2.0, 0.0, 3.0),
+        cl3(cmf, -1.0, 1.0),
+        (stoch_k - 50) / 25,
         cand, obv,
-        cl3((vix - 20) / 10),
-        sp500_enc,
+        # Market correlation (1)
+        cl3(mcorr, -1.0, 1.0),
+        # Macro (3)
+        vix_n, sp500_enc,
         (sp500_rsi - 50) / 25,
-        cl3(sc_macro), cl3(sc_fund), cl3(sc_sent),
+        # XGB scores (5)
+        cl3(sc_macro_n), cl3(sc_fund), cl3(sc_sent),
+        cl3(sc_tend), cl3(sc_mom),
+        # Seasonality (2)
         math.sin(2 * math.pi * month / 12),
         math.cos(2 * math.pi * month / 12),
+        # Earnings (1)
         earn_norm,
+        # VIX interactions (3)
+        cl3(vix_n * rsi_n),
+        cl3(vix_n * roc20_n),
+        cl3(vix_n * sc_macro_n),
     ]
 
 
@@ -1681,7 +1738,7 @@ def _run_lr_training_daily(job_id: str):
             return math.exp(-lam * max(0.0, age))
 
         BUCKETS = [7, 14, 30, 60, 90]
-        groups: dict = {b: {'X': [], 'y': [], 'y_spy': [], 'w': [], 'ts': []} for b in BUCKETS}
+        groups: dict = {b: {'X': [], 'y': [], 'y_spy': [], 'w': [], 'ts': [], 'ticker': [], 'atr': []} for b in BUCKETS}
         earnings_filtered = 0
         for row in all_rows:
             h = int(row.get('horizon_bucket') or 0)
@@ -1690,7 +1747,7 @@ def _run_lr_training_daily(job_id: str):
             signed_pct = row.get('actual_signed_pct')
             if signed_pct is None:
                 continue
-            # Paso B: earnings filter — skip rows within ±3 days of earnings
+            # Earnings filter — skip rows within ±3 days of earnings
             earn_days = row.get('next_earnings_days')
             if earn_days is not None and abs(int(earn_days)) <= 3:
                 earnings_filtered += 1
@@ -1703,6 +1760,8 @@ def _run_lr_training_daily(job_id: str):
             groups[h]['y_spy'].append(row.get('spy_actual_pct'))
             groups[h]['w'].append(decay_w(row.get('created_at')))
             groups[h]['ts'].append(row.get('created_at'))
+            groups[h]['ticker'].append(row.get('ticker', ''))
+            groups[h]['atr'].append(float(row.get('atr_pct', 1) or 1))
         print(f'[lr_train_daily] earnings filter removed {earnings_filtered} rows', flush=True)
 
         job['status'] = 'training'
@@ -1721,9 +1780,21 @@ def _run_lr_training_daily(job_id: str):
             y_np = np.array(groups[bucket]['y'], dtype=float)
             spy_np = np.array([float(v) if v is not None else float('nan') for v in groups[bucket]['y_spy']])
             w_np = np.array(groups[bucket]['w'], dtype=float)
+            ticker_arr = np.array(groups[bucket]['ticker'])
+            atr_arr = np.array(groups[bucket]['atr'], dtype=float)
+            ts_arr = np.array(groups[bucket]['ts'])
 
-            # Walk-forward: holdout = last 30 days
-            holdout_mask = np.array([_parse_ts(ts) >= holdout_cutoff for ts in groups[bucket]['ts']])
+            # Paso A: winsorize outliers at p99 (removes corrupt extremes like MRVL 72%)
+            p99 = float(np.percentile(np.abs(y_np), 99))
+            keep = np.abs(y_np) <= p99
+            n_winsor = int((~keep).sum())
+            if n_winsor > 0:
+                X_np, y_np, spy_np, w_np = X_np[keep], y_np[keep], spy_np[keep], w_np[keep]
+                ticker_arr, atr_arr, ts_arr = ticker_arr[keep], atr_arr[keep], ts_arr[keep]
+                print(f'[daily] H={bucket}: winsorized {n_winsor} outliers (p99={p99:.2f}%)', flush=True)
+
+            # Walk-forward: holdout = last 30 days (uses ts_arr post-winsorization)
+            holdout_mask = np.array([_parse_ts(ts) >= holdout_cutoff for ts in ts_arr])
             tv_mask = ~holdout_mask
             if tv_mask.sum() >= 20:
                 X_tv, y_tv, spy_tv, w_tv = X_np[tv_mask], y_np[tv_mask], spy_np[tv_mask], w_np[tv_mask]
@@ -1835,6 +1906,80 @@ def _run_lr_training_daily(job_id: str):
                 f'val_mae_ridge={val_mae_ridge} lgbm_val_mae={lgbm_val_mae}',
                 flush=True,
             )
+
+            # Paso C: train per-cluster LGBM models for this bucket
+            import optuna as _optuna_cl
+            _optuna_cl.logging.set_verbosity(_optuna_cl.logging.WARNING)
+            cluster_upserts = []
+            tv_ticker = ticker_arr[tv_mask] if tv_mask.sum() >= 20 else ticker_arr
+            tv_X = X_np[tv_mask] if tv_mask.sum() >= 20 else X_np
+            tv_y = y_np[tv_mask] if tv_mask.sum() >= 20 else y_np
+            tv_spy = spy_np[tv_mask] if tv_mask.sum() >= 20 else spy_np
+            tv_w = w_np[tv_mask] if tv_mask.sum() >= 20 else w_np
+            for cl_name in set(TICKER_CLUSTERS.values()):
+                cl_mask = np.array([TICKER_CLUSTERS.get(t, '') == cl_name for t in tv_ticker])
+                if cl_mask.sum() < 50:
+                    continue
+                cl_X = tv_X[cl_mask]; cl_y = tv_y[cl_mask]
+                cl_spy = tv_spy[cl_mask]; cl_w = tv_w[cl_mask]
+                vb_cl = ~np.isnan(cl_y) & ~np.isnan(cl_spy)
+                cl_beta = 0.0
+                if vb_cl.sum() >= 20:
+                    yb = cl_y[vb_cl]; spb = cl_spy[vb_cl]
+                    sc_cl = spb - spb.mean(); d_cl = float(np.dot(sc_cl, sc_cl))
+                    if d_cl > 1e-10:
+                        cl_beta = float(np.clip(np.dot(yb - yb.mean(), sc_cl) / d_cl, -0.5, 3.0))
+                split_cl = max(10, int(len(cl_X) * 0.8))
+                cl_Xtr, cl_Xvl = cl_X[:split_cl], cl_X[split_cl:]
+                cl_ytr = apply_beta_adj(cl_y[:split_cl], cl_spy[:split_cl], cl_beta)
+                cl_yvl = apply_beta_adj(cl_y[split_cl:], cl_spy[split_cl:], cl_beta)
+                cl_wtr = cl_w[:split_cl]
+                scaler_cl = StandardScaler()
+                cl_Xtr_s = scaler_cl.fit_transform(cl_Xtr)
+                cl_Xvl_s = scaler_cl.transform(cl_Xvl) if len(cl_Xvl) > 0 else np.empty((0, cl_Xtr.shape[1]))
+                tm_cl = ~np.isnan(cl_ytr)
+                vm_cl = ~np.isnan(cl_yvl) if len(cl_Xvl_s) > 0 else np.zeros(0, dtype=bool)
+                if tm_cl.sum() < 30:
+                    continue
+
+                def _cl_obj(trial, Xtr=cl_Xtr_s, ytr=cl_ytr, wtr=cl_wtr, Xvl=cl_Xvl_s, yvl=cl_yvl, tmk=tm_cl, vmk=vm_cl):
+                    p = dict(
+                        num_leaves=trial.suggest_int('num_leaves', 15, 63),
+                        learning_rate=trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+                        min_child_samples=trial.suggest_int('min_child_samples', 5, 30),
+                        max_depth=trial.suggest_int('max_depth', 3, 7),
+                        subsample=trial.suggest_float('subsample', 0.6, 1.0),
+                        colsample_bytree=trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                        reg_alpha=trial.suggest_float('reg_alpha', 0.0, 1.0),
+                        reg_lambda=trial.suggest_float('reg_lambda', 0.0, 5.0),
+                        n_estimators=300, random_state=42, verbose=-1, objective='regression_l1',
+                    )
+                    m = lgb.LGBMRegressor(**p)
+                    m.fit(Xtr[tmk], ytr[tmk], sample_weight=wtr[tmk])
+                    if vmk.sum() >= 5:
+                        return float(np.mean(np.abs(yvl[vmk] - m.predict(Xvl[vmk]))))
+                    return float(np.mean(np.abs(ytr[tmk] - m.predict(Xtr[tmk]))))
+
+                _study_cl = _optuna_cl.create_study(direction='minimize', sampler=_optuna_cl.samplers.TPESampler(seed=42))
+                _study_cl.optimize(_cl_obj, n_trials=25, show_progress_bar=False)
+                best_cl = _study_cl.best_params
+                lgb_cl = lgb.LGBMRegressor(**best_cl, n_estimators=600, random_state=42, verbose=-1, objective='regression_l1')
+                eval_cl = [(cl_Xvl_s[vm_cl], cl_yvl[vm_cl])] if vm_cl.sum() >= 5 else None
+                cbs_cl = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_cl else None
+                lgb_cl.fit(cl_Xtr_s[tm_cl], cl_ytr[tm_cl], sample_weight=cl_wtr[tm_cl], eval_set=eval_cl, callbacks=cbs_cl)
+                cl_val_mae = float(np.mean(np.abs(cl_yvl[vm_cl] - lgb_cl.predict(cl_Xvl_s[vm_cl])))) if vm_cl.sum() > 0 else None
+                cl_b64 = base64.b64encode(pickle.dumps(lgb_cl)).decode('utf-8')
+                cluster_upserts.append({
+                    'cluster_name': cl_name, 'horizon_bucket': bucket,
+                    'lgbm_model': cl_b64, 'lgbm_val_mae': cl_val_mae,
+                    'beta_spy': cl_beta, 'train_samples': int(tm_cl.sum()),
+                    'feature_names': DAILY_FEATURE_NAMES,
+                    'feature_means': scaler_cl.mean_.tolist(),
+                    'feature_stds': scaler_cl.scale_.tolist(),
+                })
+                print(f'[daily_cluster] H={bucket} {cl_name}: n={tm_cl.sum()} beta={cl_beta:.3f} val_mae={cl_val_mae}', flush=True)
+            for cu in cluster_upserts:
+                sb.rpc('upsert_daily_cluster_model', {'p_params': [cu]}).execute()
 
         for u in upserts:
             sb.rpc('upsert_daily_signed_params', {'p_params': [u]}).execute()
@@ -2007,6 +2152,128 @@ def _load_lgbm_cluster_models_cached():
     _lgbm_cluster_cache = new_cache
     _lgbm_cluster_cache_ts = time.time()
     return _lgbm_cluster_cache
+
+
+_lgbm_daily_cache: dict = {}
+_lgbm_daily_cache_ts: float = 0.0
+_lgbm_daily_cluster_cache: dict = {}
+_lgbm_daily_cluster_cache_ts: float = 0.0
+
+
+def _load_lgbm_daily_models_cached():
+    """Daily LGBM global models. Keys: horizon_bucket str. Values: (model, scaler, beta, avg_mag)."""
+    global _lgbm_daily_cache, _lgbm_daily_cache_ts
+    if time.time() - _lgbm_daily_cache_ts < 600 and _lgbm_daily_cache:
+        return _lgbm_daily_cache
+    from supabase import create_client
+    from sklearn.preprocessing import StandardScaler as _SS
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    resp = sb.table('model_signed_params_daily').select(
+        'horizon_bucket,lgbm_model,feature_means,feature_stds,beta_spy,avg_actual_mag,train_samples'
+    ).execute()
+    new_cache: dict = {}
+    for row in resp.data or []:
+        if not row.get('lgbm_model'):
+            continue
+        key = str(row['horizon_bucket'])
+        try:
+            m = pickle.loads(base64.b64decode(row['lgbm_model']))
+            means = row.get('feature_means') or []
+            stds  = row.get('feature_stds')  or []
+            if len(means) != len(DAILY_FEATURE_NAMES):
+                print(f'[lgbm_daily] H={key}: feature dim {len(means)} != {len(DAILY_FEATURE_NAMES)} — skip', flush=True)
+                continue
+            sc = _SS()
+            sc.mean_ = np.array(means); sc.scale_ = np.array(stds)
+            sc.var_ = sc.scale_ ** 2; sc.n_samples_seen_ = int(row.get('train_samples') or 1)
+            sc.n_features_in_ = len(means)
+            new_cache[key] = (m, sc, float(row.get('beta_spy') or 0), float(row.get('avg_actual_mag') or 2.0))
+        except Exception as e:
+            print(f'[lgbm_daily] error H={key}: {e}', flush=True)
+    _lgbm_daily_cache = new_cache
+    _lgbm_daily_cache_ts = time.time()
+    print(f'[lgbm_daily] loaded {len(new_cache)} global models', flush=True)
+    return _lgbm_daily_cache
+
+
+def _load_lgbm_daily_cluster_models_cached():
+    """Daily LGBM cluster models. Keys: 'cluster:horizon'. Values: (model, scaler, beta)."""
+    global _lgbm_daily_cluster_cache, _lgbm_daily_cluster_cache_ts
+    if time.time() - _lgbm_daily_cluster_cache_ts < 600 and _lgbm_daily_cluster_cache:
+        return _lgbm_daily_cluster_cache
+    from supabase import create_client
+    from sklearn.preprocessing import StandardScaler as _SS
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    resp = sb.table('lgbm_cluster_models_daily').select(
+        'cluster_name,horizon_bucket,lgbm_model,feature_means,feature_stds,beta_spy,train_samples'
+    ).execute()
+    new_cache: dict = {}
+    for row in resp.data or []:
+        if not row.get('lgbm_model'):
+            continue
+        key = f"{row['cluster_name']}:{row['horizon_bucket']}"
+        try:
+            m = pickle.loads(base64.b64decode(row['lgbm_model']))
+            means = row.get('feature_means') or []
+            stds  = row.get('feature_stds')  or []
+            if not means or not stds:
+                continue
+            sc = _SS()
+            sc.mean_ = np.array(means); sc.scale_ = np.array(stds)
+            sc.var_ = sc.scale_ ** 2; sc.n_samples_seen_ = int(row.get('train_samples') or 1)
+            sc.n_features_in_ = len(means)
+            new_cache[key] = (m, sc, float(row.get('beta_spy') or 0))
+        except Exception as e:
+            print(f'[lgbm_daily_cluster] error {key}: {e}', flush=True)
+    _lgbm_daily_cluster_cache = new_cache
+    _lgbm_daily_cluster_cache_ts = time.time()
+    print(f'[lgbm_daily_cluster] loaded {len(new_cache)} cluster models', flush=True)
+    return _lgbm_daily_cluster_cache
+
+
+@app.route('/api/predict_lgbm_daily', methods=['POST', 'OPTIONS'])
+def predict_lgbm_daily():
+    """Daily LGBM inference endpoint. Called by crear-prediccion edge function."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    body = request.get_json() or {}
+    indicators  = body.get('indicators', {})
+    horizon_bucket = body.get('horizon_bucket')
+    ticker  = body.get('ticker', '')
+    spy_pct = float(body.get('spy_pct') or 0)
+    if horizon_bucket is None:
+        return jsonify({'ok': False, 'error': 'horizon_bucket required'}), 400
+    try:
+        global_models  = _load_lgbm_daily_models_cached()
+        cluster_models = _load_lgbm_daily_cluster_models_cached()
+        h_key = str(int(horizon_bucket))
+        if h_key not in global_models:
+            return jsonify({'ok': False, 'error': f'No LGBM daily model for H={horizon_bucket}'}), 404
+        g_model, g_scaler, g_beta, avg_mag = global_models[h_key]
+        feats = _extract_daily_features(indicators)
+        if len(feats) != len(DAILY_FEATURE_NAMES):
+            return jsonify({'ok': False, 'error': f'Feature dim mismatch: {len(feats)} vs {len(DAILY_FEATURE_NAMES)}'}), 500
+        X = np.array([feats], dtype=float)
+        cluster = TICKER_CLUSTERS.get(ticker, '')
+        c_key = f'{cluster}:{int(horizon_bucket)}' if cluster else None
+        if c_key and c_key in cluster_models:
+            c_model, c_scaler, c_beta = cluster_models[c_key]
+            pred = float(c_model.predict(c_scaler.transform(X))[0]) + c_beta * spy_pct
+            model_used = 'cluster'
+        else:
+            pred = float(g_model.predict(g_scaler.transform(X))[0]) + g_beta * spy_pct
+            model_used = 'global'
+        return jsonify({
+            'ok': True,
+            'predicted_pct': round(pred, 4),
+            'horizon_bucket': int(horizon_bucket),
+            'avg_actual_mag': round(avg_mag, 4),
+            'model_used': model_used,
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 def _get_market_session(minutes_since_open: float) -> str:
