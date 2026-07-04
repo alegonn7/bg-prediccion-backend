@@ -2248,9 +2248,15 @@ def predict_lgbm_daily():
     try:
         global_models  = _load_lgbm_daily_models_cached()
         cluster_models = _load_lgbm_daily_cluster_models_cached()
-        h_key = str(int(horizon_bucket))
+        # Snap any horizon to the nearest trained bucket (e.g. h=1 → 7, h=8 → 14)
+        h_int = int(horizon_bucket)
+        snapped = next((b for b in [7, 14, 30, 60, 90] if h_int <= b), 90)
+        h_key = str(snapped)
         if h_key not in global_models:
-            return jsonify({'ok': False, 'error': f'No LGBM daily model for H={horizon_bucket}'}), 404
+            # Fall back to the smallest available bucket
+            h_key = min(global_models.keys(), key=lambda k: int(k)) if global_models else None
+        if not h_key:
+            return jsonify({'ok': False, 'error': f'No LGBM daily model trained yet'}), 404
         g_model, g_scaler, g_beta, avg_mag = global_models[h_key]
         feats = _extract_daily_features(indicators)
         if len(feats) != len(DAILY_FEATURE_NAMES):
