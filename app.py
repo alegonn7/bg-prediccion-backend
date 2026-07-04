@@ -2393,7 +2393,7 @@ def predict_lgbm_all():
 # ── APScheduler: auto-train daily at 21:30 UTC ────────────────────────────────
 
 def _auto_train_all():
-    """Run intraday + daily training sequentially — called by APScheduler."""
+    """Run intraday + daily training sequentially — called by APScheduler or /api/auto_train."""
     intra_id = str(uuid.uuid4())[:12]
     lr_training_jobs[intra_id] = {
         'status': 'starting', 'models_done': 0, 'models_total': 0,
@@ -2409,6 +2409,16 @@ def _auto_train_all():
         'start_time': time.time(), 'error': None,
     }
     _run_lr_training_daily(daily_id)
+
+
+@app.route('/api/auto_train', methods=['POST', 'OPTIONS'])
+def auto_train():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    threading.Thread(target=_auto_train_all, daemon=True).start()
+    return jsonify({'ok': True, 'message': 'intraday + daily training started'})
 
 
 try:
