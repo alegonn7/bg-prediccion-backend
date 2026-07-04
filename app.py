@@ -1737,7 +1737,7 @@ def _run_lr_training_daily(job_id: str):
             age = (now_utc - _parse_ts(ts_str)).total_seconds() / 86400
             return math.exp(-lam * max(0.0, age))
 
-        BUCKETS = [7, 14, 30, 60, 90]
+        BUCKETS = [1, 7, 14, 30, 60, 90]
         groups: dict = {b: {'X': [], 'y': [], 'y_spy': [], 'w': [], 'ts': [], 'ticker': [], 'atr': []} for b in BUCKETS}
         earnings_filtered = 0
         for row in all_rows:
@@ -2250,7 +2250,7 @@ def predict_lgbm_daily():
         cluster_models = _load_lgbm_daily_cluster_models_cached()
         # Snap any horizon to the nearest trained bucket (e.g. h=1 → 7, h=8 → 14)
         h_int = int(horizon_bucket)
-        snapped = next((b for b in [7, 14, 30, 60, 90] if h_int <= b), 90)
+        snapped = next((b for b in [1, 7, 14, 30, 60, 90] if h_int <= b), 90)
         h_key = str(snapped)
         if h_key not in global_models:
             # Fall back to the smallest available bucket
