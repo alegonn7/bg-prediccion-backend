@@ -2190,8 +2190,10 @@ def _run_lr_training_daily(job_id: str):
             tv_mask = ~holdout_mask
             if tv_mask.sum() >= 20:
                 X_tv, y_tv, spy_tv, w_tv = X_np[tv_mask], y_np[tv_mask], spy_np[tv_mask], w_np[tv_mask]
+                atr_tv = np.clip(atr_arr[tv_mask], 0.1, 20.0)
             else:
                 X_tv, y_tv, spy_tv, w_tv = X_np, y_np, spy_np, w_np
+                atr_tv = np.clip(atr_arr, 0.1, 20.0)
 
             # OLS beta_spy per bucket: y_total = beta * spy + idio
             # Paso E: allow negative beta (defensive stocks have beta < 0 legitimately)
@@ -2209,6 +2211,8 @@ def _run_lr_training_daily(job_id: str):
             y_train = apply_beta_adj(y_tv[:split], spy_tv[:split], beta_spy)
             y_val   = apply_beta_adj(y_tv[split:], spy_tv[split:], beta_spy)
             w_train = w_tv[:split]
+            atr_train = atr_tv[:split]
+            atr_val   = atr_tv[split:] if split < len(atr_tv) else np.ones(0)
 
             scaler = StandardScaler()
             X_train_s = scaler.fit_transform(X_train)
@@ -2230,12 +2234,18 @@ def _run_lr_training_daily(job_id: str):
             if vm.sum() > 0:
                 val_mae_ridge = float(np.mean(np.abs(y_val[vm] - reg.predict(X_val_s[vm]))))
 
+            # ATR normalization: train LightGBM on (return / ATR) so scale is uniform across tickers
+            atr_tr_valid = np.clip(atr_train[tm], 0.1, 20.0)
+            atr_train_mean = float(np.mean(atr_tr_valid))
+            y_train_norm = y_train / atr_train  # shape matches y_train; NaN rows excluded by tm mask
+
             # Paso C: LightGBM daily — Optuna-tuned hyperparams + early stopping
             lgbm_model_b64 = lgbm_val_mae = None
             if tm.sum() >= 30:
                 import optuna as _optuna
                 _optuna.logging.set_verbosity(_optuna.logging.WARNING)
                 has_val_d = vm.sum() >= 5
+                atr_val_valid = np.clip(atr_val[vm], 0.1, 20.0) if vm.sum() > 0 else np.ones(0)
 
                 def _lgbm_daily_obj(trial):
                     p = dict(
@@ -2251,10 +2261,13 @@ def _run_lr_training_daily(job_id: str):
                         objective='regression_l1',
                     )
                     m = lgb.LGBMRegressor(**p)
-                    m.fit(X_train_s[tm], y_train[tm], sample_weight=w_train[tm])
+                    m.fit(X_train_s[tm], y_train_norm[tm], sample_weight=w_train[tm])
                     if has_val_d:
-                        return float(np.mean(np.abs(y_val[vm] - m.predict(X_val_s[vm]))))
-                    return float(np.mean(np.abs(y_train[tm] - m.predict(X_train_s[tm]))))
+                        # evaluate in real % (denormalize) so MAE is comparable
+                        pred_real = m.predict(X_val_s[vm]) * atr_val_valid
+                        return float(np.mean(np.abs(y_val[vm] - pred_real)))
+                    pred_real_tr = m.predict(X_train_s[tm]) * atr_tr_valid
+                    return float(np.mean(np.abs(y_train[tm] - pred_real_tr)))
 
                 _study_d = _optuna.create_study(
                     direction='minimize', sampler=_optuna.samplers.TPESampler(seed=42)
@@ -2264,16 +2277,19 @@ def _run_lr_training_daily(job_id: str):
                 best_p_d = _study_d.best_params
                 print(f'[optuna_daily] H={bucket} best={best_p_d} val_mae={_study_d.best_value:.4f}', flush=True)
 
-                eval_set_d = [(X_val_s[vm], y_val[vm])] if has_val_d else None
+                # Eval set uses ATR-normalized targets so early stopping monitors normalized loss
+                eval_set_d = [(X_val_s[vm], y_val[vm] / atr_val_valid)] if has_val_d else None
                 callbacks_d = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_d else None
                 lgb_reg = lgb.LGBMRegressor(
                     **best_p_d, n_estimators=600, random_state=42, verbose=-1,
                     objective='regression_l1',
                 )
-                lgb_reg.fit(X_train_s[tm], y_train[tm], sample_weight=w_train[tm],
+                lgb_reg.fit(X_train_s[tm], y_train_norm[tm], sample_weight=w_train[tm],
                             eval_set=eval_set_d, callbacks=callbacks_d)
                 if vm.sum() > 0:
-                    val_residuals = np.abs(y_val[vm] - lgb_reg.predict(X_val_s[vm]))
+                    # Denormalize predictions to get real % MAE
+                    val_preds_real = lgb_reg.predict(X_val_s[vm]) * atr_val_valid
+                    val_residuals = np.abs(y_val[vm] - val_preds_real)
                     lgbm_val_mae = float(np.mean(val_residuals))
                     lgbm_error_p25 = float(np.percentile(val_residuals, 25))
                     lgbm_error_p50 = float(np.percentile(val_residuals, 50))
@@ -2302,6 +2318,8 @@ def _run_lr_training_daily(job_id: str):
                 'error_p50': lgbm_error_p50,
                 'error_p75': lgbm_error_p75,
                 'error_p90': lgbm_error_p90,
+                'atr_normalized': True,
+                'atr_train_mean': round(atr_train_mean, 4),
             })
             job['models_done'] += 1
             print(
@@ -2572,7 +2590,7 @@ def _load_lgbm_daily_models_cached():
     from sklearn.preprocessing import StandardScaler as _SS
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     resp = sb.table('model_signed_params_daily').select(
-        'horizon_bucket,lgbm_model,feature_means,feature_stds,beta_spy,avg_actual_mag,train_samples'
+        'horizon_bucket,lgbm_model,feature_means,feature_stds,beta_spy,avg_actual_mag,train_samples,atr_normalized,atr_train_mean'
     ).execute()
     new_cache: dict = {}
     for row in resp.data or []:
@@ -2590,7 +2608,9 @@ def _load_lgbm_daily_models_cached():
             sc.mean_ = np.array(means); sc.scale_ = np.array(stds)
             sc.var_ = sc.scale_ ** 2; sc.n_samples_seen_ = int(row.get('train_samples') or 1)
             sc.n_features_in_ = len(means)
-            new_cache[key] = (m, sc, float(row.get('beta_spy') or 0), float(row.get('avg_actual_mag') or 2.0))
+            atr_norm = bool(row.get('atr_normalized') or False)
+            atr_mean = float(row.get('atr_train_mean') or 1.5)
+            new_cache[key] = (m, sc, float(row.get('beta_spy') or 0), float(row.get('avg_actual_mag') or 2.0), atr_norm, atr_mean)
         except Exception as e:
             print(f'[lgbm_daily] error H={key}: {e}', flush=True)
     _lgbm_daily_cache = new_cache
@@ -2660,19 +2680,22 @@ def predict_lgbm_daily():
             h_key = min(global_models.keys(), key=lambda k: int(k)) if global_models else None
         if not h_key:
             return jsonify({'ok': False, 'error': f'No LGBM daily model trained yet'}), 404
-        g_model, g_scaler, g_beta, avg_mag = global_models[h_key]
+        g_model, g_scaler, g_beta, avg_mag, g_atr_norm, g_atr_mean = global_models[h_key]
         feats = _extract_daily_features(indicators)
         if len(feats) != len(DAILY_FEATURE_NAMES):
             return jsonify({'ok': False, 'error': f'Feature dim mismatch: {len(feats)} vs {len(DAILY_FEATURE_NAMES)}'}), 500
         X = np.array([feats], dtype=float)
+        current_atr = float(indicators.get('atr_pct') or g_atr_mean or 1.5)
         cluster = TICKER_CLUSTERS.get(ticker, '')
         c_key = f'{cluster}:{int(horizon_bucket)}' if cluster else None
         if c_key and c_key in cluster_models:
             c_model, c_scaler, c_beta = cluster_models[c_key]
-            pred = float(c_model.predict(c_scaler.transform(X))[0]) + c_beta * spy_pct
+            raw = float(c_model.predict(c_scaler.transform(X))[0])
+            pred = (raw * current_atr if g_atr_norm else raw) + c_beta * spy_pct
             model_used = 'cluster'
         else:
-            pred = float(g_model.predict(g_scaler.transform(X))[0]) + g_beta * spy_pct
+            raw = float(g_model.predict(g_scaler.transform(X))[0])
+            pred = (raw * current_atr if g_atr_norm else raw) + g_beta * spy_pct
             model_used = 'global'
         return jsonify({
             'ok': True,
