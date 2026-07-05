@@ -1565,6 +1565,347 @@ def lr_train_status(job_id):
     })
 
 
+# ── Historical training samples from price_history ────────────────────────────
+
+def _build_historical_samples(sb) -> list:
+    """
+    Fetch price_history for all tickers, compute technical indicators from OHLCV,
+    and generate (features, target) training samples for all 6 daily horizons.
+
+    XGB scores and earnings_days are set to 0 (neutral) since we have no historical data.
+    SPY and ^VIX are fetched from price_history to compute market/macro features.
+    Returns list of dicts compatible with get_daily_training_data() format.
+    """
+    import pandas as pd
+    import numpy as np
+    from datetime import date as dt_date, timedelta
+
+    HORIZONS = [1, 7, 14, 30, 60, 90]
+    MIN_LOOKBACK = 210  # need 200 for SMA200 + buffer
+
+    print('[hist] Fetching price_history...', flush=True)
+    # Fetch all data in one shot — 38k rows
+    resp = sb.from_('price_history').select(
+        'trade_date, open, high, low, close, volume, assets!asset_id(ticker)'
+    ).order('trade_date').execute()
+    rows = resp.data or []
+    if not rows:
+        print('[hist] No data in price_history', flush=True)
+        return []
+
+    # Group by ticker
+    by_ticker: dict = {}
+    for r in rows:
+        ticker = r.get('assets', {}).get('ticker') if r.get('assets') else None
+        if not ticker:
+            continue
+        if ticker not in by_ticker:
+            by_ticker[ticker] = []
+        by_ticker[ticker].append(r)
+
+    print(f'[hist] {len(by_ticker)} tickers loaded', flush=True)
+
+    # Build SPY series for correlation + sp500 features
+    def _make_df(ticker_rows):
+        df = pd.DataFrame([{
+            'date': r['trade_date'],
+            'open': float(r['open'] or 0),
+            'high': float(r['high'] or 0),
+            'low':  float(r['low']  or 0),
+            'close': float(r['close'] or 0),
+            'volume': float(r['volume'] or 0),
+        } for r in ticker_rows])
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').reset_index(drop=True)
+        return df
+
+    spy_df = _make_df(by_ticker.get('SPY', []))
+    vix_df = _make_df(by_ticker.get('^VIX', []))
+
+    # Date → SPY close lookup
+    spy_close_map: dict = {}
+    spy_ret_map: dict   = {}  # log returns for future spy
+    if not spy_df.empty:
+        spy_close_map = dict(zip(spy_df['date'].dt.date, spy_df['close']))
+        spy_ret = spy_df['close'].pct_change() * 100
+        spy_ret_map = dict(zip(spy_df['date'].dt.date, spy_ret))
+
+    vix_close_map: dict = {}
+    if not vix_df.empty:
+        vix_close_map = dict(zip(vix_df['date'].dt.date, vix_df['close']))
+
+    def _safe(s: pd.Series, i: int, default=0.0) -> float:
+        v = s.iloc[i] if 0 <= i < len(s) else None
+        return float(v) if v is not None and not (isinstance(v, float) and np.isnan(v)) else default
+
+    def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """Compute all needed indicators for a ticker. Returns df with indicator columns."""
+        c = df['close']
+        h = df['high']
+        l = df['low']
+        v = df['volume']
+
+        # ── SMAs ──
+        df['sma20']  = c.rolling(20).mean()
+        df['sma50']  = c.rolling(50).mean()
+        df['sma200'] = c.rolling(200).mean()
+        df['price_vs_sma20']  = (c - df['sma20'])  / df['sma20'].replace(0, np.nan)  * 100
+        df['price_vs_sma50']  = (c - df['sma50'])  / df['sma50'].replace(0, np.nan)  * 100
+        df['price_vs_sma200'] = (c - df['sma200']) / df['sma200'].replace(0, np.nan) * 100
+
+        # ── RSI 14 ──
+        delta = c.diff()
+        gain  = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+        loss  = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
+        rs    = gain / loss.replace(0, 1e-10)
+        df['rsi_14'] = 100 - 100 / (1 + rs)
+
+        # ── MACD ──
+        ema12 = c.ewm(span=12, adjust=False).mean()
+        ema26 = c.ewm(span=26, adjust=False).mean()
+        macd  = ema12 - ema26
+        df['macd_histogram'] = macd - macd.ewm(span=9, adjust=False).mean()
+
+        # ── Stochastic RSI ──
+        rsi_min = df['rsi_14'].rolling(14).min()
+        rsi_max = df['rsi_14'].rolling(14).max()
+        df['stoch_rsi'] = (df['rsi_14'] - rsi_min) / (rsi_max - rsi_min + 1e-10) * 100
+
+        # ── MFI 14 ──
+        tp = (h + l + c) / 3
+        mf = tp * v
+        pos_mf = mf.where(tp > tp.shift(1), 0.0)
+        neg_mf = mf.where(tp < tp.shift(1), 0.0)
+        pmf14  = pos_mf.rolling(14).sum()
+        nmf14  = neg_mf.rolling(14).sum()
+        df['mfi_14'] = 100 - 100 / (1 + pmf14 / nmf14.replace(0, 1e-10))
+
+        # ── CCI 20 ──
+        hl_avg = (h + l + c) / 3
+        df['cci_20'] = (hl_avg - hl_avg.rolling(20).mean()) / (0.015 * hl_avg.rolling(20).std().replace(0, 1e-10))
+
+        # ── Williams %R 14 ──
+        hi14 = h.rolling(14).max()
+        lo14 = l.rolling(14).min()
+        df['williams_r_14'] = (hi14 - c) / (hi14 - lo14 + 1e-10) * -100
+
+        # ── Bollinger Bands ──
+        bb_mid = c.rolling(20).mean()
+        bb_std = c.rolling(20).std()
+        bb_upper = bb_mid + 2 * bb_std
+        bb_lower = bb_mid - 2 * bb_std
+        df['bb_pct_b']  = (c - bb_lower) / (bb_upper - bb_lower + 1e-10)
+        bb_width = (bb_upper - bb_lower) / bb_mid.replace(0, np.nan)
+        df['bb_squeeze'] = (bb_width < bb_width.rolling(60).min() * 1.1).astype(float)
+
+        # ── ATR % ──
+        prev_c = c.shift(1)
+        tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+        atr14 = tr.ewm(span=14, adjust=False).mean()
+        df['atr_pct'] = atr14 / c.replace(0, np.nan) * 100
+
+        # ── Historical Volatility 20 / 60 ──
+        log_ret = np.log(c / c.shift(1))
+        df['hist_vol_20'] = log_ret.rolling(20).std() * np.sqrt(252) * 100
+        df['hist_vol_60'] = log_ret.rolling(60).std() * np.sqrt(252) * 100
+
+        # ── ADX 14 ──
+        ph = h - h.shift(1)
+        pl = l.shift(1) - l
+        pdm = ph.where((ph > 0) & (ph > pl), 0.0).fillna(0)
+        ndm = pl.where((pl > 0) & (pl > ph), 0.0).fillna(0)
+        atr_s = tr.ewm(span=14, adjust=False).mean()
+        pdi = 100 * pdm.ewm(span=14, adjust=False).mean() / atr_s.replace(0, 1e-10)
+        ndi = 100 * ndm.ewm(span=14, adjust=False).mean() / atr_s.replace(0, 1e-10)
+        dx  = 100 * (pdi - ndi).abs() / (pdi + ndi + 1e-10)
+        df['adx_14'] = dx.ewm(span=14, adjust=False).mean()
+
+        # ── ROC ──
+        df['roc_5']  = c.pct_change(5)  * 100
+        df['roc_10'] = c.pct_change(10) * 100
+        df['roc_20'] = c.pct_change(20) * 100
+
+        # ── Support / Resistance (52-week rolling) ──
+        df['support_52w']    = l.rolling(252, min_periods=20).min()
+        df['resistance_52w'] = h.rolling(252, min_periods=20).max()
+        df['dist_to_support_pct']    = (c - df['support_52w'])    / c.replace(0, np.nan) * 100
+        df['dist_to_resistance_pct'] = (df['resistance_52w'] - c) / c.replace(0, np.nan) * 100
+
+        # ── Volume ratio (vs 20d avg) ──
+        avg_vol = v.rolling(20).mean()
+        df['volume_ratio'] = v / avg_vol.replace(0, 1e-10)
+
+        # ── CMF 20 ──
+        mfm = ((c - l) - (h - c)) / (h - l + 1e-10)
+        df['cmf_20'] = (mfm * v).rolling(20).sum() / v.rolling(20).sum().replace(0, 1e-10)
+
+        # ── Stochastic K ──
+        lo14k = l.rolling(14).min()
+        hi14k = h.rolling(14).max()
+        df['stoch_k'] = (c - lo14k) / (hi14k - lo14k + 1e-10) * 100
+
+        # ── Candle signal (simple: body vs range) ──
+        body = (c - df['open']).abs()
+        total_range = (h - l).replace(0, 1e-10)
+        body_ratio = body / total_range
+        df['candle_signal'] = np.where(
+            (c > df['open']) & (body_ratio > 0.6), 'bullish',
+            np.where((c < df['open']) & (body_ratio > 0.6), 'bearish', 'neutral')
+        )
+
+        # ── OBV trend ──
+        obv = (v * np.sign(c.diff().fillna(0))).cumsum()
+        obv_slope = obv.rolling(5).apply(lambda x: (x[-1] - x[0]) / (len(x) - 1) if len(x) > 1 else 0, raw=True)
+        df['obv_trend'] = np.where(obv_slope > 0, 'rising', np.where(obv_slope < 0, 'falling', 'flat'))
+
+        return df
+
+    def _compute_spy_features(spy_df: pd.DataFrame, df: pd.DataFrame) -> pd.Series:
+        """For each date in df, compute market_corr_60d and sp500_rsi vs SPY."""
+        # Merge df dates with SPY dates to get aligned series
+        merged = df[['date', 'close']].rename(columns={'close': 'ticker_c'}).merge(
+            spy_df[['date', 'close', 'rsi_14']].rename(columns={'close': 'spy_c', 'rsi_14': 'spy_rsi'}),
+            on='date', how='left'
+        )
+        ticker_ret = merged['ticker_c'].pct_change()
+        spy_ret    = merged['spy_c'].pct_change()
+        corr60 = ticker_ret.rolling(60).corr(spy_ret)
+        merged['market_corr_60d'] = corr60
+        merged['sp500_rsi'] = merged['spy_rsi']
+
+        # SP500 trend: SMA50 vs SMA200
+        spy_sma50  = merged['spy_c'].rolling(50).mean()
+        spy_sma200 = merged['spy_c'].rolling(200).mean()
+        merged['sp500_trend'] = np.where(
+            spy_sma50 > spy_sma200, 'bullish',
+            np.where(spy_sma50 < spy_sma200, 'bearish', 'neutral')
+        )
+        return merged[['date', 'market_corr_60d', 'sp500_rsi', 'sp500_trend']]
+
+    # Pre-compute SPY indicators
+    if not spy_df.empty:
+        spy_df = _compute_indicators(spy_df)
+
+    all_samples = []
+    skip_tickers = {'SPY', '^VIX', '^GSPC', 'QQQ'}  # market proxies, skip as targets
+
+    for ticker, ticker_rows in by_ticker.items():
+        if ticker in skip_tickers:
+            continue
+        if len(ticker_rows) < MIN_LOOKBACK:
+            continue
+
+        try:
+            df = _make_df(ticker_rows)
+            df = _compute_indicators(df)
+
+            # Merge SPY features
+            if not spy_df.empty:
+                spy_feats = _compute_spy_features(spy_df, df)
+                df = df.merge(spy_feats, on='date', how='left')
+            else:
+                df['market_corr_60d'] = 0.0
+                df['sp500_rsi'] = 50.0
+                df['sp500_trend'] = 'neutral'
+
+            # Date index for fast future lookup
+            date_arr = df['date'].dt.date.values
+            close_arr = df['close'].values
+            n = len(df)
+
+            for i in range(MIN_LOOKBACK, n):
+                if pd.isna(df['sma200'].iloc[i]):
+                    continue
+
+                cur_date   = date_arr[i]
+                cur_close  = close_arr[i]
+                if cur_close <= 0:
+                    continue
+
+                # VIX on this date
+                vix_val = vix_close_map.get(cur_date, 20.0) or 20.0
+
+                # Build feature row dict matching _extract_daily_features format
+                row = {
+                    'price_vs_sma20':  _safe(df['price_vs_sma20'], i),
+                    'price_vs_sma50':  _safe(df['price_vs_sma50'], i),
+                    'price_vs_sma200': _safe(df['price_vs_sma200'], i),
+                    'rsi_14':          _safe(df['rsi_14'], i, 50),
+                    'macd_histogram':  _safe(df['macd_histogram'], i),
+                    'stoch_rsi':       _safe(df['stoch_rsi'], i, 50),
+                    'mfi_14':          _safe(df['mfi_14'], i, 50),
+                    'cci_20':          _safe(df['cci_20'], i),
+                    'williams_r_14':   _safe(df['williams_r_14'], i, -50),
+                    'bb_pct_b':        _safe(df['bb_pct_b'], i, 0.5),
+                    'bb_squeeze':      bool(df['bb_squeeze'].iloc[i]),
+                    'atr_pct':         _safe(df['atr_pct'], i, 1),
+                    'hist_vol_20':     _safe(df['hist_vol_20'], i, 20),
+                    'hist_vol_60':     _safe(df['hist_vol_60'], i, 20),
+                    'adx_14':          _safe(df['adx_14'], i, 20),
+                    'roc_5':           _safe(df['roc_5'], i),
+                    'roc_10':          _safe(df['roc_10'], i),
+                    'roc_20':          _safe(df['roc_20'], i),
+                    'dist_to_support_pct':    _safe(df['dist_to_support_pct'], i, 5),
+                    'dist_to_resistance_pct': _safe(df['dist_to_resistance_pct'], i, 5),
+                    'volume_ratio':    _safe(df['volume_ratio'], i, 1),
+                    'cmf_20':          _safe(df['cmf_20'], i),
+                    'stoch_k':         _safe(df['stoch_k'], i, 50),
+                    'candle_signal':   df['candle_signal'].iloc[i],
+                    'obv_trend':       df['obv_trend'].iloc[i],
+                    'market_corr_60d': _safe(df['market_corr_60d'], i) if 'market_corr_60d' in df.columns else 0.0,
+                    'vix_level':       vix_val,
+                    'sp500_trend':     df['sp500_trend'].iloc[i] if 'sp500_trend' in df.columns else 'neutral',
+                    'sp500_rsi':       _safe(df['sp500_rsi'], i, 50) if 'sp500_rsi' in df.columns else 50.0,
+                    # XGB scores → 0 (no historical data)
+                    'score_macro': 0.0, 'score_fundamental': 0.0,
+                    'score_sentimiento': 0.0, 'score_tendencia': 0.0, 'score_momentum': 0.0,
+                    'created_month': cur_date.month,
+                    'next_earnings_days': None,  # → earn_norm = 0
+                }
+
+                feats = _extract_daily_features(row)
+                if len(feats) != len(DAILY_FEATURE_NAMES):
+                    continue
+
+                # Future returns for each horizon
+                for h in HORIZONS:
+                    target_cal_date = cur_date + timedelta(days=h)
+                    # Find first trading date >= target_cal_date in this ticker
+                    future_idx = None
+                    for j in range(i + 1, min(i + h + 10, n)):
+                        if date_arr[j] >= target_cal_date:
+                            future_idx = j
+                            break
+                    if future_idx is None:
+                        continue
+                    future_close = close_arr[future_idx]
+                    if future_close <= 0:
+                        continue
+                    actual_ret = (future_close - cur_close) / cur_close * 100
+
+                    # SPY return over same period (for beta adjustment)
+                    future_spy = spy_close_map.get(date_arr[future_idx])
+                    cur_spy    = spy_close_map.get(cur_date)
+                    spy_ret_val = ((future_spy - cur_spy) / cur_spy * 100
+                                   if future_spy and cur_spy and cur_spy > 0 else None)
+
+                    all_samples.append({
+                        'ticker':           ticker,
+                        'horizon_bucket':   h,
+                        'actual_signed_pct': actual_ret,
+                        'spy_actual_pct':    spy_ret_val,
+                        'created_at':       cur_date.isoformat(),
+                        '_features':        feats,  # pre-computed, skip _extract_daily_features
+                        '_is_historical':   True,
+                    })
+        except Exception as e:
+            print(f'[hist] {ticker} error: {e}', flush=True)
+            continue
+
+    print(f'[hist] generated {len(all_samples)} historical samples', flush=True)
+    return all_samples
+
+
 # ── Daily signed Ridge training ───────────────────────────────────────────────
 
 DAILY_FEATURE_NAMES = [
@@ -1730,9 +2071,17 @@ def _run_lr_training_daily(job_id: str):
         job['status'] = 'fetching'
 
         resp = sb.rpc('get_daily_training_data', {'p_limit': 100000}).execute()
-        all_rows = resp.data or []
+        real_rows = resp.data or []
+        print(f'[lr_train_daily] fetched {len(real_rows)} real rows', flush=True)
+
+        # Build historical samples from price_history (walk-forward, no lookahead)
+        hist_samples = _build_historical_samples(sb)
+
+        # Merge: real rows (weight 3x) + historical rows (weight 1x)
+        # Historical rows carry pre-computed features in '_features' key
+        all_rows = real_rows + hist_samples
         job['total_samples'] = len(all_rows)
-        print(f'[lr_train_daily] fetched {len(all_rows)} rows', flush=True)
+        print(f'[lr_train_daily] total rows: {len(all_rows)} ({len(real_rows)} real + {len(hist_samples)} historical)', flush=True)
 
         if not all_rows:
             job['status'] = 'error'
@@ -1757,19 +2106,27 @@ def _run_lr_training_daily(job_id: str):
             signed_pct = row.get('actual_signed_pct')
             if signed_pct is None:
                 continue
-            # Earnings filter — skip rows within ±3 days of earnings
-            earn_days = row.get('next_earnings_days')
-            if earn_days is not None and abs(int(earn_days)) <= 3:
-                earnings_filtered += 1
-                continue
-            feats = _extract_daily_features(row)
+            is_hist = row.get('_is_historical', False)
+            if is_hist:
+                # Historical sample: features already computed, no earnings filter
+                feats = row['_features']
+                base_weight = 1.0  # historical weight 1x
+            else:
+                # Real prediction: earnings filter + compute features
+                earn_days = row.get('next_earnings_days')
+                if earn_days is not None and abs(int(earn_days)) <= 3:
+                    earnings_filtered += 1
+                    continue
+                feats = _extract_daily_features(row)
+                base_weight = 3.0  # real predictions weight 3x (more reliable)
             if len(feats) != len(DAILY_FEATURE_NAMES):
                 continue
+            ts_str = row.get('created_at', '')
             groups[h]['X'].append(feats)
             groups[h]['y'].append(float(signed_pct))
             groups[h]['y_spy'].append(row.get('spy_actual_pct'))
-            groups[h]['w'].append(decay_w(row.get('created_at')))
-            groups[h]['ts'].append(row.get('created_at'))
+            groups[h]['w'].append(decay_w(ts_str) * base_weight)
+            groups[h]['ts'].append(ts_str)
             groups[h]['ticker'].append(row.get('ticker', ''))
             groups[h]['atr'].append(float(row.get('atr_pct', 1) or 1))
         print(f'[lr_train_daily] earnings filter removed {earnings_filtered} rows', flush=True)
