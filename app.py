@@ -2900,7 +2900,7 @@ def _run_load_historical_ohlcv(job_id: str):
             try:
                 df = yf.download(
                     ticker, start=START_DATE, end=END_DATE,
-                    auto_adjust=True, progress=False, show_errors=False,
+                    auto_adjust=True, progress=False,
                 )
                 if df is None or df.empty:
                     print(f'[hist_load] {ticker}: no data', flush=True)
