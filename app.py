@@ -1583,14 +1583,21 @@ def _build_historical_samples(sb) -> list:
     HORIZONS = [1, 7, 14, 30, 60, 90]
     MIN_LOOKBACK = 210  # need 200 for SMA200 + buffer
 
-    print('[hist] Fetching price_history...', flush=True)
+    print('[hist] Fetching assets ticker map...', flush=True)
+    asset_map: dict = {}  # asset_id -> ticker
+    a_resp = sb.from_('assets').select('id, ticker').execute()
+    for a in (a_resp.data or []):
+        asset_map[a['id']] = a['ticker']
+    print(f'[hist] {len(asset_map)} assets in map', flush=True)
+
+    print('[hist] Fetching price_history (paginated)...', flush=True)
     # Paginate — PostgREST caps at 1000 rows/request
     rows = []
     PAGE = 1000
     offset = 0
     while True:
         resp = sb.from_('price_history').select(
-            'trade_date, open, high, low, close, volume, assets(ticker)'
+            'asset_id, trade_date, open, high, low, close, volume'
         ).order('trade_date').range(offset, offset + PAGE - 1).execute()
         chunk = resp.data or []
         rows.extend(chunk)
@@ -1602,10 +1609,10 @@ def _build_historical_samples(sb) -> list:
         print('[hist] No data in price_history', flush=True)
         return []
 
-    # Group by ticker
+    # Group by ticker using asset_map
     by_ticker: dict = {}
     for r in rows:
-        ticker = r.get('assets', {}).get('ticker') if r.get('assets') else None
+        ticker = asset_map.get(r.get('asset_id'))
         if not ticker:
             continue
         if ticker not in by_ticker:
@@ -2806,6 +2813,24 @@ def auto_train():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
     threading.Thread(target=_auto_train_all, daemon=True).start()
     return jsonify({'ok': True, 'message': 'intraday + daily training started'})
+
+
+@app.route('/api/hist_sample_test', methods=['POST', 'OPTIONS'])
+def hist_sample_test():
+    """Diagnóstico: corre _build_historical_samples y devuelve el conteo por horizonte."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        samples = _build_historical_samples(sb)
+        from collections import Counter
+        by_h = Counter(s['horizon_bucket'] for s in samples)
+        return jsonify({'ok': True, 'total': len(samples), 'by_horizon': dict(by_h)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
 
 
 try:
