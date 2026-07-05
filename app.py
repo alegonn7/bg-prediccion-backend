@@ -2817,20 +2817,52 @@ def auto_train():
 
 @app.route('/api/hist_sample_test', methods=['POST', 'OPTIONS'])
 def hist_sample_test():
-    """Diagnóstico: corre _build_historical_samples y devuelve el conteo por horizonte."""
+    """Diagnóstico paso a paso de _build_historical_samples."""
     if request.method == 'OPTIONS':
         return '', 200
     if not _check_secret():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
+
+    import traceback
+    result = {'step': 'start'}
     try:
-        from supabase import create_client
-        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        samples = _build_historical_samples(sb)
+        from supabase import create_client as _cc
+        sb2 = _cc(SUPABASE_URL, SUPABASE_KEY)
+        result['step'] = 'supabase_ok'
+
+        # Step 1: fetch assets
+        a_resp = sb2.from_('assets').select('id, ticker').execute()
+        asset_map2 = {a['id']: a['ticker'] for a in (a_resp.data or [])}
+        result['assets_count'] = len(asset_map2)
+        result['step'] = 'assets_ok'
+
+        # Step 2: fetch first page of price_history
+        ph_resp = sb2.from_('price_history').select(
+            'asset_id, trade_date, open, high, low, close, volume'
+        ).range(0, 999).execute()
+        ph_rows = ph_resp.data or []
+        result['ph_first_page'] = len(ph_rows)
+        result['step'] = 'ph_page1_ok'
+
+        # Step 3: count tickers in first page
+        tickers_in_page = set(asset_map2.get(r['asset_id']) for r in ph_rows if r.get('asset_id'))
+        result['tickers_in_page1'] = len(tickers_in_page)
+        result['sample_tickers'] = list(tickers_in_page)[:5]
+        result['step'] = 'count_ok'
+
+        # Step 4: run full historical build
+        samples = _build_historical_samples(sb2)
         from collections import Counter
         by_h = Counter(s['horizon_bucket'] for s in samples)
-        return jsonify({'ok': True, 'total': len(samples), 'by_horizon': dict(by_h)})
+        result['total_samples'] = len(samples)
+        result['by_horizon'] = dict(by_h)
+        result['step'] = 'done'
+
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)})
+        result['error'] = str(e)
+        result['trace'] = traceback.format_exc()[-1000:]
+
+    return jsonify({'ok': result.get('step') == 'done', **result})
 
 
 try:
