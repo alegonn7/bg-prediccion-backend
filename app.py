@@ -1245,10 +1245,16 @@ def _run_lr_training(job_id: str):
                 lgb_s.fit(Xs_s, ys_norm_s, sample_weight=ws_s, eval_set=eval_set_s, callbacks=cbs)
 
                 sess_val_mae = None
+                sess_ep25 = sess_ep50 = sess_ep75 = sess_ep90 = None
                 if val_sm_s.sum() > 0:
                     atr_v2 = np.clip(X_v[:, atr_idx][val_sm_s], 0.1, 10.0)
                     preds_d = lgb_s.predict(X_v_s[val_sm_s]) * atr_v2
-                    sess_val_mae = float(np.mean(np.abs(y_v[val_sm_s] - preds_d)))
+                    val_residuals_s = np.abs(y_v[val_sm_s] - preds_d)
+                    sess_val_mae = float(np.mean(val_residuals_s))
+                    sess_ep25 = float(np.percentile(val_residuals_s, 25))
+                    sess_ep50 = float(np.percentile(val_residuals_s, 50))
+                    sess_ep75 = float(np.percentile(val_residuals_s, 75))
+                    sess_ep90 = float(np.percentile(val_residuals_s, 90))
 
                 lgbm_s_b64 = base64.b64encode(pickle.dumps(lgb_s)).decode('utf-8')
                 lgbm_s_imp = dict(zip(LR_FEATURE_NAMES, lgb_s.feature_importances_.tolist()))
@@ -1269,6 +1275,10 @@ def _run_lr_training(job_id: str):
                 'train_samples': int(tr_mask.sum()),
                 'last_updated': now_utc.isoformat(),
                 'beta_spy': sess_beta,
+                'error_p25': sess_ep25,
+                'error_p50': sess_ep50,
+                'error_p75': sess_ep75,
+                'error_p90': sess_ep90,
             })
             print(f'[lr_train:session] {model_name}:{horizon_minutes}:{session} n={tr_mask.sum()} val_mae={sess_val_mae} beta={sess_beta:.3f}', flush=True)
 
@@ -1881,7 +1891,14 @@ def _run_lr_training_daily(job_id: str):
                 lgb_reg.fit(X_train_s[tm], y_train[tm], sample_weight=w_train[tm],
                             eval_set=eval_set_d, callbacks=callbacks_d)
                 if vm.sum() > 0:
-                    lgbm_val_mae = float(np.mean(np.abs(y_val[vm] - lgb_reg.predict(X_val_s[vm]))))
+                    val_residuals = np.abs(y_val[vm] - lgb_reg.predict(X_val_s[vm]))
+                    lgbm_val_mae = float(np.mean(val_residuals))
+                    lgbm_error_p25 = float(np.percentile(val_residuals, 25))
+                    lgbm_error_p50 = float(np.percentile(val_residuals, 50))
+                    lgbm_error_p75 = float(np.percentile(val_residuals, 75))
+                    lgbm_error_p90 = float(np.percentile(val_residuals, 90))
+                else:
+                    lgbm_error_p25 = lgbm_error_p50 = lgbm_error_p75 = lgbm_error_p90 = None
                 lgbm_model_b64 = base64.b64encode(pickle.dumps(lgb_reg)).decode('utf-8')
 
             upserts.append({
@@ -1899,6 +1916,10 @@ def _run_lr_training_daily(job_id: str):
                 'lgbm_val_mae': lgbm_val_mae,
                 'val_mae_ridge': val_mae_ridge,
                 'beta_spy': beta_spy,
+                'error_p25': lgbm_error_p25,
+                'error_p50': lgbm_error_p50,
+                'error_p75': lgbm_error_p75,
+                'error_p90': lgbm_error_p90,
             })
             job['models_done'] += 1
             print(
