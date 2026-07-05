@@ -10,8 +10,9 @@ import uuid
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-training_jobs: dict = {}   # job_id -> live status dict
-prediction_jobs: dict = {} # job_id -> live status dict
+training_jobs: dict = {}        # job_id -> live status dict
+prediction_jobs: dict = {}      # job_id -> live status dict
+historical_load_jobs: dict = {} # job_id -> live status dict
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
@@ -1159,23 +1160,37 @@ def _run_lr_training(job_id: str):
             if mso < 270: return 'midday'
             return 'close'
 
-        session_groups: dict = {}
+        # Aggregate by (horizon_minutes, session) — pool ALL model_names so small sessions
+        # like 'morning' (~44 total rows) still have enough data to train one shared model.
+        session_groups: dict = {}    # (horizon_minutes, session) -> data
+        session_mnames: dict = {}    # (horizon_minutes, session) -> set of model_names seen
         for row in all_rows:
             mso = float(row.get('minutes_since_open') or 0)
             sess = _session_from_mso(mso)
-            key = (row['model_name'], int(row['horizon_minutes']), sess)
+            key = (int(row['horizon_minutes']), sess)
             if key not in session_groups:
-                session_groups[key] = {'X': [], 'y_signed': [], 'y_spy': [], 'w': [], 'ts': []}
+                session_groups[key] = {'X': [], 'y_signed': [], 'y_spy': [], 'w': [], 'ts': [], 'seen': set()}
+                session_mnames[key] = set()
+            # Deduplicate by (created_at) across model_names — same event counted once
+            dedup = row.get('created_at', '')
+            if dedup and dedup in session_groups[key]['seen']:
+                session_mnames[key].add(row['model_name'])
+                continue
+            if dedup:
+                session_groups[key]['seen'].add(dedup)
             session_groups[key]['X'].append([float(row.get(fn) or 0) for fn in LR_FEATURE_NAMES])
             session_groups[key]['y_signed'].append(row.get('actual_signed_pct'))
             session_groups[key]['y_spy'].append(row.get('spy_actual_pct'))
             session_groups[key]['w'].append(decay_w(row.get('created_at')))
             session_groups[key]['ts'].append(row.get('created_at'))
+            session_mnames[key].add(row['model_name'])
+
+        # All known model_names (for filling upsert entries with shared model)
+        all_model_names = list(MODEL_FEATURE_NAMES.keys())
 
         session_upserts = []
         atr_idx = LR_FEATURE_NAMES.index('atr_pct')
-        session_lgbm_cache: dict = {}  # {(horizon_minutes, session): cached lgbm info}
-        for (model_name, horizon_minutes, session), sdata in session_groups.items():
+        for (horizon_minutes, session), sdata in session_groups.items():
             X_np = np.array(sdata['X'], dtype=float)
             y_np = np.array([float(v) if v is not None else float('nan') for v in sdata['y_signed']])
             spy_np = np.array([float(v) if v is not None else float('nan') for v in sdata['y_spy']])
@@ -1210,6 +1225,7 @@ def _run_lr_training(job_id: str):
 
             tr_mask = ~np.isnan(y_tr)
             if tr_mask.sum() < 20:
+                print(f'[lr_train:session] {horizon_minutes}:{session} only {tr_mask.sum()} train samples — skip', flush=True)
                 continue
 
             scaler_s = StandardScaler()
@@ -1227,66 +1243,56 @@ def _run_lr_training(job_id: str):
                 atr_v = np.clip(X_v[:, atr_idx][val_sm_s], 0.1, 10.0)
                 eval_set_s = [(X_v_s[val_sm_s], y_v[val_sm_s] / atr_v)]
 
-            sess_cache_key = (horizon_minutes, session)
-            if sess_cache_key in session_lgbm_cache:
-                sc = session_lgbm_cache[sess_cache_key]
-                lgbm_s_b64 = sc['model_b64']
-                sess_val_mae = sc['val_mae']
-                lgbm_s_imp = sc['importance']
-                sess_beta = sc['beta_spy']
-            else:
-                cbs = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_s else None
-                lgb_s = lgb.LGBMRegressor(
-                    n_estimators=500, learning_rate=0.05, num_leaves=31,
-                    min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
-                    random_state=42, verbose=-1,
-                    objective='regression_l1',  # directly minimizes MAE
-                )
-                lgb_s.fit(Xs_s, ys_norm_s, sample_weight=ws_s, eval_set=eval_set_s, callbacks=cbs)
+            cbs = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_set_s else None
+            lgb_s = lgb.LGBMRegressor(
+                n_estimators=500, learning_rate=0.05, num_leaves=31,
+                min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
+                random_state=42, verbose=-1,
+                objective='regression_l1',
+            )
+            lgb_s.fit(Xs_s, ys_norm_s, sample_weight=ws_s, eval_set=eval_set_s, callbacks=cbs)
 
-                sess_val_mae = None
-                sess_ep25 = sess_ep50 = sess_ep75 = sess_ep90 = None
-                if val_sm_s.sum() > 0:
-                    atr_v2 = np.clip(X_v[:, atr_idx][val_sm_s], 0.1, 10.0)
-                    preds_d = lgb_s.predict(X_v_s[val_sm_s]) * atr_v2
-                    val_residuals_s = np.abs(y_v[val_sm_s] - preds_d)
-                    sess_val_mae = float(np.mean(val_residuals_s))
-                    sess_ep25 = float(np.percentile(val_residuals_s, 25))
-                    sess_ep50 = float(np.percentile(val_residuals_s, 50))
-                    sess_ep75 = float(np.percentile(val_residuals_s, 75))
-                    sess_ep90 = float(np.percentile(val_residuals_s, 90))
+            sess_val_mae = None
+            sess_ep25 = sess_ep50 = sess_ep75 = sess_ep90 = None
+            if val_sm_s.sum() > 0:
+                atr_v2 = np.clip(X_v[:, atr_idx][val_sm_s], 0.1, 10.0)
+                preds_d = lgb_s.predict(X_v_s[val_sm_s]) * atr_v2
+                val_residuals_s = np.abs(y_v[val_sm_s] - preds_d)
+                sess_val_mae = float(np.mean(val_residuals_s))
+                sess_ep25 = float(np.percentile(val_residuals_s, 25))
+                sess_ep50 = float(np.percentile(val_residuals_s, 50))
+                sess_ep75 = float(np.percentile(val_residuals_s, 75))
+                sess_ep90 = float(np.percentile(val_residuals_s, 90))
 
-                lgbm_s_b64 = base64.b64encode(pickle.dumps(lgb_s)).decode('utf-8')
-                lgbm_s_imp = dict(zip(LR_FEATURE_NAMES, lgb_s.feature_importances_.tolist()))
-                session_lgbm_cache[sess_cache_key] = {
-                    'model_b64': lgbm_s_b64,
-                    'val_mae': sess_val_mae,
-                    'importance': lgbm_s_imp,
+            lgbm_s_b64 = base64.b64encode(pickle.dumps(lgb_s)).decode('utf-8')
+            lgbm_s_imp = dict(zip(LR_FEATURE_NAMES, lgb_s.feature_importances_.tolist()))
+            n_train = int(tr_mask.sum())
+            print(f'[lr_train:session] {horizon_minutes}min:{session} n={n_train} val_mae={sess_val_mae} beta={sess_beta:.3f}', flush=True)
+
+            # Store one row per model_name (all share the same pooled model)
+            mnames_for_key = session_mnames.get((horizon_minutes, session), set()) or set(all_model_names)
+            for mn in mnames_for_key:
+                session_upserts.append({
+                    'model_name': mn,
+                    'horizon_minutes': horizon_minutes,
+                    'market_session': session,
+                    'lgbm_model': lgbm_s_b64,
+                    'lgbm_val_mae': sess_val_mae,
+                    'lgbm_feature_importance': lgbm_s_imp,
+                    'train_samples': n_train,
+                    'last_updated': now_utc.isoformat(),
                     'beta_spy': sess_beta,
-                }
-
-            session_upserts.append({
-                'model_name': model_name,
-                'horizon_minutes': horizon_minutes,
-                'market_session': session,
-                'lgbm_model': lgbm_s_b64,
-                'lgbm_val_mae': sess_val_mae,
-                'lgbm_feature_importance': lgbm_s_imp,
-                'train_samples': int(tr_mask.sum()),
-                'last_updated': now_utc.isoformat(),
-                'beta_spy': sess_beta,
-                'error_p25': sess_ep25,
-                'error_p50': sess_ep50,
-                'error_p75': sess_ep75,
-                'error_p90': sess_ep90,
-            })
-            print(f'[lr_train:session] {model_name}:{horizon_minutes}:{session} n={tr_mask.sum()} val_mae={sess_val_mae} beta={sess_beta:.3f}', flush=True)
+                    'error_p25': sess_ep25,
+                    'error_p50': sess_ep50,
+                    'error_p75': sess_ep75,
+                    'error_p90': sess_ep90,
+                })
 
         for su in session_upserts:
             sb.table('lgbm_session_models_intraday').upsert(
                 su, on_conflict='model_name,horizon_minutes,market_session'
             ).execute()
-        print(f'[lr_train] session models: {len(session_upserts)} trained', flush=True)
+        print(f'[lr_train] session models: {len(session_upserts)} upserts done', flush=True)
 
         # ── Step 8: Per-ticker LGBM models ───────────────────────────────────
         # Group unique (ticker, horizon) from all_rows — deduplicated across model_names.
@@ -2789,23 +2795,189 @@ def predict_lgbm_all():
 
 # ── APScheduler: auto-train daily at 21:30 UTC ────────────────────────────────
 
+def _keep_alive_loop(stop_event: threading.Event):
+    """Pings our own /api/health every 4 min to prevent Render free-tier spin-down."""
+    import urllib.request
+    self_url = os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
+    if not self_url:
+        print('[keep_alive] RENDER_EXTERNAL_URL not set — skipping', flush=True)
+        return
+    ping_url = f'{self_url}/api/health'
+    print(f'[keep_alive] started, pinging {ping_url} every 4 min', flush=True)
+    while not stop_event.wait(timeout=240):  # wake every 4 minutes
+        try:
+            urllib.request.urlopen(ping_url, timeout=10)
+            print('[keep_alive] ping ok', flush=True)
+        except Exception as e:
+            print(f'[keep_alive] ping failed: {e}', flush=True)
+    print('[keep_alive] stopped', flush=True)
+
+
 def _auto_train_all():
     """Run intraday + daily training sequentially — called by APScheduler or /api/auto_train."""
-    intra_id = str(uuid.uuid4())[:12]
-    lr_training_jobs[intra_id] = {
-        'status': 'starting', 'models_done': 0, 'models_total': 0,
-        'models_trained': 0, 'total_samples': 0, 'results': {},
-        'start_time': time.time(), 'error': None,
-    }
-    _run_lr_training(intra_id)
+    stop_event = threading.Event()
+    ka_thread = threading.Thread(target=_keep_alive_loop, args=(stop_event,), daemon=True)
+    ka_thread.start()
 
-    daily_id = str(uuid.uuid4())[:12]
-    daily_training_jobs[daily_id] = {
-        'status': 'starting', 'models_done': 0, 'models_total': 5,
-        'models_trained': 0, 'total_samples': 0,
-        'start_time': time.time(), 'error': None,
+    try:
+        intra_id = str(uuid.uuid4())[:12]
+        lr_training_jobs[intra_id] = {
+            'status': 'starting', 'models_done': 0, 'models_total': 0,
+            'models_trained': 0, 'total_samples': 0, 'results': {},
+            'start_time': time.time(), 'error': None,
+        }
+        _run_lr_training(intra_id)
+
+        daily_id = str(uuid.uuid4())[:12]
+        daily_training_jobs[daily_id] = {
+            'status': 'starting', 'models_done': 0, 'models_total': 5,
+            'models_trained': 0, 'total_samples': 0,
+            'start_time': time.time(), 'error': None,
+        }
+        _run_lr_training_daily(daily_id)
+    finally:
+        stop_event.set()  # stop keep-alive regardless of success/failure
+
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({'ok': True})
+
+
+# ── Historical OHLCV loader ───────────────────────────────────────────────────
+
+def _run_load_historical_ohlcv(job_id: str):
+    """Download 3+ years of daily OHLCV from yfinance and INSERT (ignore dups) into price_history."""
+    import yfinance as yf
+    import pandas as pd
+    from supabase import create_client
+
+    job = historical_load_jobs[job_id]
+    try:
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        a_resp = sb.from_('assets').select('id, ticker').execute()
+        assets = a_resp.data or []
+        ticker_to_id = {a['ticker']: a['id'] for a in assets}
+        tickers = [a['ticker'] for a in assets]
+
+        job['tickers_total'] = len(tickers)
+        job['status'] = 'downloading'
+        print(f'[hist_load] Starting for {len(tickers)} tickers', flush=True)
+
+        # Load from 2022-01-01 up to (not including) the first date of existing live data
+        START_DATE = '2022-01-01'
+        END_DATE   = '2025-01-27'  # exclusive — live data starts here
+        BATCH_SIZE = 500
+        rows_inserted = 0
+        errors = []
+
+        for i, ticker in enumerate(tickers):
+            job['tickers_done'] = i
+            try:
+                df = yf.download(
+                    ticker, start=START_DATE, end=END_DATE,
+                    auto_adjust=True, progress=False, show_errors=False,
+                )
+                if df is None or df.empty:
+                    print(f'[hist_load] {ticker}: no data', flush=True)
+                    continue
+
+                # yfinance v0.2 may return MultiIndex columns — flatten
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [col[0] for col in df.columns]
+
+                asset_id = ticker_to_id.get(ticker)
+                if not asset_id:
+                    print(f'[hist_load] {ticker}: no asset_id in DB', flush=True)
+                    continue
+
+                def _safe_float(val, fallback):
+                    try:
+                        f = float(val)
+                        return f if f > 0 and not math.isnan(f) else fallback
+                    except (TypeError, ValueError):
+                        return fallback
+
+                rows = []
+                for date, row in df.iterrows():
+                    raw_close = row.get('Close') or row.get('close') or 0
+                    try:
+                        close_val = float(raw_close)
+                    except (TypeError, ValueError):
+                        continue
+                    if close_val <= 0 or math.isnan(close_val):
+                        continue
+
+                    vol = row.get('Volume') or row.get('volume') or 0
+                    try:
+                        vol_int = int(float(vol)) if vol else 0
+                    except (TypeError, ValueError):
+                        vol_int = 0
+
+                    rows.append({
+                        'asset_id':   asset_id,
+                        'trade_date': date.strftime('%Y-%m-%d'),
+                        'open':       _safe_float(row.get('Open'), close_val),
+                        'high':       _safe_float(row.get('High'), close_val),
+                        'low':        _safe_float(row.get('Low'), close_val),
+                        'close':      close_val,
+                        'volume':     vol_int,
+                        'adj_close':  close_val,
+                    })
+
+                if not rows:
+                    continue
+
+                for bs in range(0, len(rows), BATCH_SIZE):
+                    batch = rows[bs:bs + BATCH_SIZE]
+                    sb.table('price_history').insert(batch, ignore_duplicates=True).execute()
+                    rows_inserted += len(batch)
+
+                job['rows_inserted'] = rows_inserted
+                print(f'[hist_load] {ticker}: +{len(rows)} rows (total {rows_inserted})', flush=True)
+
+            except Exception as e:
+                msg = f'{ticker}: {e}'
+                errors.append(msg)
+                print(f'[hist_load] ERROR {msg}', flush=True)
+
+        job['tickers_done'] = len(tickers)
+        job['rows_inserted'] = rows_inserted
+        job['errors'] = errors
+        job['status'] = 'done'
+        print(f'[hist_load] Done — {rows_inserted} rows, {len(errors)} errors', flush=True)
+
+    except Exception as e:
+        import traceback
+        job['status'] = 'error'
+        job['error'] = str(e)
+        job['trace'] = traceback.format_exc()[-2000:]
+        print(f'[hist_load] FATAL: {e}', flush=True)
+
+
+@app.route('/api/load_historical_ohlcv', methods=['POST', 'OPTIONS'])
+def load_historical_ohlcv():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    job_id = str(uuid.uuid4())[:12]
+    historical_load_jobs[job_id] = {
+        'status': 'starting', 'tickers_done': 0, 'tickers_total': 0,
+        'rows_inserted': 0, 'errors': [], 'start_time': time.time(),
     }
-    _run_lr_training_daily(daily_id)
+    threading.Thread(target=_run_load_historical_ohlcv, args=(job_id,), daemon=True).start()
+    return jsonify({'ok': True, 'job_id': job_id})
+
+
+@app.route('/api/load_historical_ohlcv_status/<job_id>', methods=['GET'])
+def load_historical_ohlcv_status(job_id):
+    job = historical_load_jobs.get(job_id)
+    if not job:
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    elapsed = round(time.time() - job['start_time'], 1)
+    return jsonify({'ok': True, 'elapsed_s': elapsed, **job})
 
 
 @app.route('/api/auto_train', methods=['POST', 'OPTIONS'])
