@@ -2081,6 +2081,10 @@ def _run_lr_training_daily(job_id: str):
     HALF_LIFE_DAYS = 180
     lam = math.log(2) / HALF_LIFE_DAYS
 
+    # Keep-alive to prevent Render from spinning down during long training
+    _ka_stop = threading.Event()
+    threading.Thread(target=_keep_alive_loop, args=(_ka_stop,), daemon=True).start()
+
     def _parse_ts(ts):
         if not ts:
             return datetime.min.replace(tzinfo=timezone.utc)
@@ -2413,6 +2417,9 @@ def _run_lr_training_daily(job_id: str):
         job['status'] = 'error'
         job['error'] = str(e)
         print(f'[lr_train_daily] ERROR: {e}', flush=True)
+
+    finally:
+        _ka_stop.set()
 
 
 @app.route('/api/train_lr_daily', methods=['POST', 'OPTIONS'])
