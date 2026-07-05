@@ -1584,11 +1584,20 @@ def _build_historical_samples(sb) -> list:
     MIN_LOOKBACK = 210  # need 200 for SMA200 + buffer
 
     print('[hist] Fetching price_history...', flush=True)
-    # Fetch all data in one shot — 38k rows
-    resp = sb.from_('price_history').select(
-        'trade_date, open, high, low, close, volume, assets!asset_id(ticker)'
-    ).order('trade_date').execute()
-    rows = resp.data or []
+    # Paginate — PostgREST caps at 1000 rows/request
+    rows = []
+    PAGE = 1000
+    offset = 0
+    while True:
+        resp = sb.from_('price_history').select(
+            'trade_date, open, high, low, close, volume, assets(ticker)'
+        ).order('trade_date').range(offset, offset + PAGE - 1).execute()
+        chunk = resp.data or []
+        rows.extend(chunk)
+        if len(chunk) < PAGE:
+            break
+        offset += PAGE
+    print(f'[hist] fetched {len(rows)} rows from price_history', flush=True)
     if not rows:
         print('[hist] No data in price_history', flush=True)
         return []
