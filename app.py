@@ -1596,21 +1596,24 @@ def _build_historical_samples(sb) -> list:
         asset_map[a['id']] = a['ticker']
     print(f'[hist] {len(asset_map)} assets in map', flush=True)
 
-    print('[hist] Fetching price_history (paginated)...', flush=True)
-    # Paginate — PostgREST caps at 1000 rows/request
+    print('[hist] Fetching pre-live price_history (paginated)...', flush=True)
+    # Only fetch data BEFORE live predictions started (2025-01-27).
+    # This gives the 2022-2024 data loaded separately — clean non-overlapping training window.
+    # With MAX_HIST_DAYS=150 per ticker this stays well under Render's 512 MB limit.
+    LIVE_CUTOFF_DATE = '2025-01-27'
     rows = []
     PAGE = 1000
     offset = 0
     while True:
         resp = sb.from_('price_history').select(
             'asset_id, trade_date, open, high, low, close, volume'
-        ).order('trade_date').range(offset, offset + PAGE - 1).execute()
+        ).lt('trade_date', LIVE_CUTOFF_DATE).order('trade_date').range(offset, offset + PAGE - 1).execute()
         chunk = resp.data or []
         rows.extend(chunk)
         if len(chunk) < PAGE:
             break
         offset += PAGE
-    print(f'[hist] fetched {len(rows)} rows from price_history', flush=True)
+    print(f'[hist] fetched {len(rows)} pre-live rows from price_history', flush=True)
     if not rows:
         print('[hist] No data in price_history', flush=True)
         return []
@@ -1835,7 +1838,12 @@ def _build_historical_samples(sb) -> list:
             close_arr = df['close'].values
             n = len(df)
 
-            for i in range(MIN_LOOKBACK, n):
+            # Only generate samples from the last 150 trading days to avoid OOM.
+            # SMA200 still computed on full history above (correct lookback).
+            MAX_HIST_DAYS = 150
+            start_i = max(MIN_LOOKBACK, n - MAX_HIST_DAYS)
+
+            for i in range(start_i, n):
                 if pd.isna(df['sma200'].iloc[i]):
                     continue
 
