@@ -2079,7 +2079,10 @@ def _run_lr_training_daily(job_id: str):
         if not ts:
             return datetime.min.replace(tzinfo=timezone.utc)
         if isinstance(ts, str):
-            return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+            dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         return ts if getattr(ts, 'tzinfo', None) else ts.replace(tzinfo=timezone.utc)
 
     try:
