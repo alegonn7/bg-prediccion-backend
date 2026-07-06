@@ -2499,7 +2499,8 @@ def _lgbm_predict(m, X: 'np.ndarray') -> float:
 
 
 def _load_lgbm_models_cached():
-    """Returns dict[key] = (model, beta_spy). beta_spy=0 for old models without it."""
+    """Returns dict[key] = (model, beta_spy). beta_spy=0 for old models without it.
+    Deduplicates by horizon: all model_names sharing a horizon reuse the same object."""
     global _lgbm_cache, _lgbm_cache_ts
     if time.time() - _lgbm_cache_ts < 600 and _lgbm_cache:
         return _lgbm_cache
@@ -2509,17 +2510,22 @@ def _load_lgbm_models_cached():
         'model_name,horizon_minutes,lgbm_model,beta_spy'
     ).execute()
     new_cache: dict = {}
+    horizon_models: dict = {}  # horizon_minutes -> (model, beta) — unpickled once per horizon
     for row in resp.data or []:
         if row.get('lgbm_model'):
-            key = f"{row['model_name']}:{row['horizon_minutes']}"
+            h = row['horizon_minutes']
+            key = f"{row['model_name']}:{h}"
             try:
-                model = pickle.loads(base64.b64decode(row['lgbm_model']))
-                beta = float(row.get('beta_spy') or 0.0)
-                new_cache[key] = (model, beta)
+                if h not in horizon_models:
+                    model = pickle.loads(base64.b64decode(row['lgbm_model']))
+                    beta = float(row.get('beta_spy') or 0.0)
+                    horizon_models[h] = (model, beta)
+                new_cache[key] = horizon_models[h]
             except Exception:
                 pass
     _lgbm_cache = new_cache
     _lgbm_cache_ts = time.time()
+    print(f'[lgbm_cache] loaded {len(new_cache)} keys, {len(horizon_models)} unique models', flush=True)
     return _lgbm_cache
 
 
