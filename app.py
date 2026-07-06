@@ -1045,16 +1045,15 @@ def _run_lr_training(job_id: str):
 
                 def _lgbm_objective(trial):
                     params = dict(
-                        # Tighter bounds: small dataset (~500-2000 samples) needs strong regularization
-                        num_leaves=trial.suggest_int('num_leaves', 8, 63),
+                        num_leaves=trial.suggest_int('num_leaves', 15, 90),
                         learning_rate=trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-                        min_child_samples=trial.suggest_int('min_child_samples', 15, 80),
-                        max_depth=trial.suggest_int('max_depth', 3, 6),
-                        min_split_gain=trial.suggest_float('min_split_gain', 0.0, 1.0),
+                        min_child_samples=trial.suggest_int('min_child_samples', 10, 60),
+                        max_depth=trial.suggest_int('max_depth', 3, 7),
+                        min_split_gain=trial.suggest_float('min_split_gain', 0.0, 0.5),
                         subsample=trial.suggest_float('subsample', 0.6, 1.0),
                         colsample_bytree=trial.suggest_float('colsample_bytree', 0.6, 1.0),
-                        reg_alpha=trial.suggest_float('reg_alpha', 0.0, 2.0),
-                        reg_lambda=trial.suggest_float('reg_lambda', 0.0, 10.0),
+                        reg_alpha=trial.suggest_float('reg_alpha', 0.0, 1.0),
+                        reg_lambda=trial.suggest_float('reg_lambda', 0.0, 5.0),
                         n_estimators=300, random_state=42, verbose=-1,
                         objective='regression_l1',
                     )
