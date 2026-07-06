@@ -878,10 +878,10 @@ def _run_lr_training(job_id: str):
 
         job['status'] = 'fetching'
         # PostgREST caps at 1000 rows/request — paginate in 1000-row chunks.
-        # SQL function has 90-day filter + LIMIT 40000.
+        # SQL function has 90-day filter + LIMIT 15000.
         all_rows = []
         batch_size = 1000
-        for offset in range(0, 40001, batch_size):
+        for offset in range(0, 15001, batch_size):
             resp = sb.rpc('get_intraday_training_data').range(offset, offset + batch_size - 1).execute()
             batch = resp.data or []
             all_rows.extend(batch)
