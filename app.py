@@ -1927,6 +1927,7 @@ def _build_historical_samples(sb) -> list:
                         'created_at':       cur_date.isoformat(),
                         '_features':        feats,  # pre-computed, skip _extract_daily_features
                         '_is_historical':   True,
+                        'atr_pct':          float(df['atr_pct'].iloc[i]) if not pd.isna(df['atr_pct'].iloc[i]) else 1.0,
                     })
         except Exception as e:
             print(f'[hist] {ticker} error: {e}', flush=True)
