@@ -739,6 +739,11 @@ LR_FEATURE_NAMES = [
     'spy_return_session',
     # peer_momentum_15m: avg momentum_15m of cluster peers (5-min lag) — zero-variance until calculador v10
     'peer_momentum_15m',
+    # New features added 2026-07-06 — returned by get_intraday_training_data v2
+    'macd_hist',          # MACD histogram (numeric)
+    'orb_breakout_num',   # orb_breakout text → +1 up / -1 down / 0 none
+    'bb_squeeze_num',     # bb_squeeze bool → 1/0
+    'macd_cross_num',     # macd_cross text → +1 bullish / -1 bearish / 0 none
 ]
 
 lr_training_jobs: dict = {}
@@ -873,11 +878,10 @@ def _run_lr_training(job_id: str):
 
         job['status'] = 'fetching'
         # PostgREST caps at 1000 rows/request — paginate in 1000-row chunks.
-        # SQL function now has 60-day filter + LIMIT 20000, so each query ~700ms.
-        # 20 batches × 700ms = ~14s total (vs old 60 × 1.67s = 100s that timed out).
+        # SQL function has 90-day filter + LIMIT 40000.
         all_rows = []
         batch_size = 1000
-        for offset in range(0, 20001, batch_size):
+        for offset in range(0, 40001, batch_size):
             resp = sb.rpc('get_intraday_training_data').range(offset, offset + batch_size - 1).execute()
             batch = resp.data or []
             all_rows.extend(batch)
@@ -1041,12 +1045,16 @@ def _run_lr_training(job_id: str):
             # LightGBM — train once per horizon with Optuna tuning, reuse across model_names.
             # Target ATR-normalized so model learns in ATR units; inference denormalizes.
             lgbm_model_b64 = lgbm_val_mae = lgbm_importance = None
+            lgbm_error_p50 = lgbm_error_p75 = lgbm_error_p90 = None
             if horizon_minutes in lgbm_horizon_cache:
                 cached = lgbm_horizon_cache[horizon_minutes]
                 lgbm_model_b64 = cached['model_b64']
                 lgbm_val_mae = cached['val_mae']
                 lgbm_importance = cached['importance']
                 beta_spy = cached['beta_spy']
+                lgbm_error_p50 = cached.get('error_p50')
+                lgbm_error_p75 = cached.get('error_p75')
+                lgbm_error_p90 = cached.get('error_p90')
             elif Xs is not None and len(Xs) >= 30:
                 import optuna
                 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -1063,14 +1071,16 @@ def _run_lr_training(job_id: str):
 
                 def _lgbm_objective(trial):
                     params = dict(
-                        num_leaves=trial.suggest_int('num_leaves', 15, 127),
+                        # Tighter bounds: small dataset (~500-2000 samples) needs strong regularization
+                        num_leaves=trial.suggest_int('num_leaves', 8, 63),
                         learning_rate=trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-                        min_child_samples=trial.suggest_int('min_child_samples', 5, 50),
-                        max_depth=trial.suggest_int('max_depth', 3, 8),
+                        min_child_samples=trial.suggest_int('min_child_samples', 15, 80),
+                        max_depth=trial.suggest_int('max_depth', 3, 6),
+                        min_split_gain=trial.suggest_float('min_split_gain', 0.0, 1.0),
                         subsample=trial.suggest_float('subsample', 0.6, 1.0),
                         colsample_bytree=trial.suggest_float('colsample_bytree', 0.6, 1.0),
-                        reg_alpha=trial.suggest_float('reg_alpha', 0.0, 1.0),
-                        reg_lambda=trial.suggest_float('reg_lambda', 0.0, 5.0),
+                        reg_alpha=trial.suggest_float('reg_alpha', 0.0, 2.0),
+                        reg_lambda=trial.suggest_float('reg_lambda', 0.0, 10.0),
                         n_estimators=300, random_state=42, verbose=-1,
                         objective='regression_l1',
                     )
@@ -1098,7 +1108,11 @@ def _run_lr_training(job_id: str):
                 if val_sm.sum() > 0:
                     atr_val_raw = np.clip(X_val[:, atr_idx][val_sm], 0.1, 10.0)
                     preds_denorm = lgb_reg.predict(X_val_s[val_sm]) * atr_val_raw
-                    lgbm_val_mae = float(np.mean(np.abs(y_signed_val[val_sm] - preds_denorm)))
+                    val_residuals = np.abs(y_signed_val[val_sm] - preds_denorm)
+                    lgbm_val_mae = float(np.mean(val_residuals))
+                    lgbm_error_p50 = float(np.percentile(val_residuals, 50))
+                    lgbm_error_p75 = float(np.percentile(val_residuals, 75))
+                    lgbm_error_p90 = float(np.percentile(val_residuals, 90))
                 lgbm_model_b64 = base64.b64encode(pickle.dumps(lgb_reg)).decode('utf-8')
                 lgbm_importance = dict(zip(LR_FEATURE_NAMES, lgb_reg.feature_importances_.tolist()))
                 lgbm_horizon_cache[horizon_minutes] = {
@@ -1106,6 +1120,9 @@ def _run_lr_training(job_id: str):
                     'val_mae': lgbm_val_mae,
                     'importance': lgbm_importance,
                     'beta_spy': beta_spy,
+                    'error_p50': lgbm_error_p50,
+                    'error_p75': lgbm_error_p75,
+                    'error_p90': lgbm_error_p90,
                 }
 
             upserts.append({
@@ -1132,6 +1149,9 @@ def _run_lr_training(job_id: str):
                 'val_mae_ridge': val_mae_ridge,
                 'beta_spy': beta_spy,
                 'wf_val_mae': wf_val_mae,
+                'error_p50': lgbm_error_p50,
+                'error_p75': lgbm_error_p75,
+                'error_p90': lgbm_error_p90,
             })
             results[f'{model_name}:{horizon_minutes}'] = {
                 'samples': len(X_tv), 'accuracy': round(accuracy, 3),
@@ -1269,24 +1289,22 @@ def _run_lr_training(job_id: str):
             n_train = int(tr_mask.sum())
             print(f'[lr_train:session] {horizon_minutes}min:{session} n={n_train} val_mae={sess_val_mae} beta={sess_beta:.3f}', flush=True)
 
-            # Store one row per model_name (all share the same pooled model)
-            mnames_for_key = session_mnames.get((horizon_minutes, session), set()) or set(all_model_names)
-            for mn in mnames_for_key:
-                session_upserts.append({
-                    'model_name': mn,
-                    'horizon_minutes': horizon_minutes,
-                    'market_session': session,
-                    'lgbm_model': lgbm_s_b64,
-                    'lgbm_val_mae': sess_val_mae,
-                    'lgbm_feature_importance': lgbm_s_imp,
-                    'train_samples': n_train,
-                    'last_updated': now_utc.isoformat(),
-                    'beta_spy': sess_beta,
-                    'error_p25': sess_ep25,
-                    'error_p50': sess_ep50,
-                    'error_p75': sess_ep75,
-                    'error_p90': sess_ep90,
-                })
+            # Store single canonical row per (horizon, session) — avoids 13× storage bloat
+            session_upserts.append({
+                'model_name': '__session__',
+                'horizon_minutes': horizon_minutes,
+                'market_session': session,
+                'lgbm_model': lgbm_s_b64,
+                'lgbm_val_mae': sess_val_mae,
+                'lgbm_feature_importance': lgbm_s_imp,
+                'train_samples': n_train,
+                'last_updated': now_utc.isoformat(),
+                'beta_spy': sess_beta,
+                'error_p25': sess_ep25,
+                'error_p50': sess_ep50,
+                'error_p75': sess_ep75,
+                'error_p90': sess_ep90,
+            })
 
         for su in session_upserts:
             sb.table('lgbm_session_models_intraday').upsert(
@@ -2490,6 +2508,23 @@ _lgbm_cluster_cache: dict = {}
 _lgbm_cluster_cache_ts: float = 0.0
 
 
+def _enrich_indicators(ind: dict) -> dict:
+    """Compute numeric versions of categorical/boolean indicator fields for inference."""
+    out = dict(ind)
+    orb = out.get('orb_breakout') or ''
+    out['orb_breakout_num'] = 1.0 if orb == 'up' else -1.0 if orb == 'down' else 0.0
+    out['bb_squeeze_num'] = 1.0 if out.get('bb_squeeze') else 0.0
+    mc = out.get('macd_cross') or ''
+    out['macd_cross_num'] = 1.0 if mc == 'bullish' else -1.0 if mc == 'bearish' else 0.0
+    return out
+
+
+def _lgbm_predict(m, X: 'np.ndarray') -> float:
+    """Shape-safe predict: slices X to model's expected feature count for backward compat."""
+    n = getattr(m, 'n_features_', X.shape[1])
+    return float(m.predict(X[:, :n])[0])
+
+
 def _load_lgbm_models_cached():
     """Returns dict[key] = (model, beta_spy). beta_spy=0 for old models without it."""
     global _lgbm_cache, _lgbm_cache_ts
@@ -2751,11 +2786,12 @@ def predict_lgbm_intraday():
         if key not in models:
             return jsonify({'ok': False, 'error': 'No LightGBM model found for this model/horizon'}), 404
         m, beta = models[key]
+        indicators = _enrich_indicators(indicators)
         X = np.array([[float(indicators.get(fn) or 0) for fn in LR_FEATURE_NAMES]])
         atr_idx = LR_FEATURE_NAMES.index('atr_pct')
         atr_scale = max(0.1, float(X[0, atr_idx]))
         spy_r15 = float(indicators.get('spy_return_15m') or 0)
-        pred = float(m.predict(X)[0]) * atr_scale + beta * spy_r15
+        pred = _lgbm_predict(m, X) * atr_scale + beta * spy_r15
         return jsonify({'ok': True, 'predicted_pct': round(pred, 4)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -2776,6 +2812,7 @@ def predict_lgbm_all():
         models = _load_lgbm_models_cached()
         if not models:
             return jsonify({'ok': True, 'predictions': {}, 'models_loaded': 0})
+        indicators = _enrich_indicators(indicators)
         X = np.array([[float(indicators.get(fn) or 0) for fn in LR_FEATURE_NAMES]])
         atr_idx = LR_FEATURE_NAMES.index('atr_pct')
         atr_scale = max(0.1, float(X[0, atr_idx]))
@@ -2801,8 +2838,8 @@ def predict_lgbm_all():
                     # Continuous blend: weight ticker by its sample richness
                     c_model, c_beta = cluster_models[c_key]
                     w_t = t_n / 200.0
-                    pred_t = float(t_model.predict(X)[0]) * atr_scale + t_beta * spy_r15
-                    pred_c = float(c_model.predict(X)[0]) * atr_scale + c_beta * spy_r15
+                    pred_t = _lgbm_predict(t_model, X) * atr_scale + t_beta * spy_r15
+                    pred_c = _lgbm_predict(c_model, X) * atr_scale + c_beta * spy_r15
                     predictions[key] = round(w_t * pred_t + (1.0 - w_t) * pred_c, 4)
                     blended = True
                 else:
@@ -2811,14 +2848,15 @@ def predict_lgbm_all():
                 m, beta = cluster_models[c_key]
                 cluster_used += 1
             else:
-                sess_key = f'{key}:{session}'
-                sess_entry = session_models.get(sess_key)
+                # New storage: '__session__:horizon:session'; old rows keyed by model_name
+                sess_key = f'__session__:{horizon}:{session}'
+                sess_entry = session_models.get(sess_key) or session_models.get(f'{key}:{session}')
                 if sess_entry:
                     m, beta = sess_entry
                 else:
                     m, beta = global_m, global_beta
             if not blended:
-                pred_idio = float(m.predict(X)[0]) * atr_scale
+                pred_idio = _lgbm_predict(m, X) * atr_scale
                 predictions[key] = round(pred_idio + beta * spy_r15, 4)
         return jsonify({
             'ok': True, 'predictions': predictions,
