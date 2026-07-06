@@ -898,32 +898,6 @@ def _run_lr_training(job_id: str):
         now_utc = datetime.now(timezone.utc)
         all_rows.sort(key=lambda r: _parse_ts(r.get('created_at')))
 
-        # Earnings filter — sync calendar then exclude rows ±2 days from any earnings
-        try:
-            _sync_earnings_calendar()
-            ec_resp = sb.table('earnings_calendar').select('ticker, report_date').execute()
-            from collections import defaultdict as _dd
-            from datetime import date as _date
-            _earn_by_ticker = _dd(list)
-            for ec in (ec_resp.data or []):
-                try:
-                    _earn_by_ticker[ec['ticker']].append(_date.fromisoformat(ec['report_date']))
-                except Exception:
-                    pass
-
-            def _near_earnings(ticker, created_at_str):
-                row_date = _parse_ts(created_at_str).date()
-                for earn_d in _earn_by_ticker.get(ticker, []):
-                    if abs((row_date - earn_d).days) <= 2:
-                        return True
-                return False
-
-            pre_filter = len(all_rows)
-            all_rows = [r for r in all_rows if not _near_earnings(r.get('ticker', ''), r.get('created_at'))]
-            removed = pre_filter - len(all_rows)
-            print(f'[lr_train] earnings filter: {pre_filter} → {len(all_rows)} rows ({removed} removed)', flush=True)
-        except Exception as e_earn:
-            print(f'[lr_train] earnings filter skipped: {e_earn}', flush=True)
         holdout_cutoff = now_utc - timedelta(days=30)
 
         def decay_w(ts_str):
