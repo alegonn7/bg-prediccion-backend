@@ -568,8 +568,10 @@ app = Flask(__name__)
 
 
 def _check_secret() -> bool:
+    if not INTERNAL_SECRET:
+        return False
     secret = request.headers.get('x-internal-secret', '')
-    return not (INTERNAL_SECRET and secret != INTERNAL_SECRET)
+    return secret == INTERNAL_SECRET
 
 
 @app.after_request
