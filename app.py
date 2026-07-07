@@ -49,6 +49,53 @@ def cl3(v, lo=-3.0, hi=3.0):
     return max(lo, min(hi, float(v or 0)))
 
 
+def magnitude_weight(y_real_pct, floor=0.1):
+    """Sample weight by |actual return| — LightGBM pays more for missing big moves instead
+    of being scored equally on days the asset barely budged. Applied only to LGBM .fit()
+    calls (not Ridge/LogisticRegression), multiplied on top of the existing recency weight.
+    floor avoids zero-weighting near-flat samples entirely."""
+    return np.maximum(np.abs(np.asarray(y_real_pct, dtype=float)), floor)
+
+
+def lgbm_trial_score(mae, dir_acc, dir_acc_floor=0.5, penalty_scale=2.0):
+    """Optuna objective score (lower=better). Inflates MAE when validation-fold directional
+    accuracy is at/below a coin flip, so hyperparam search can't win purely by shrinking
+    predictions toward zero (great MAE, useless direction)."""
+    if dir_acc is None:
+        return mae
+    shortfall = max(0.0, dir_acc_floor - dir_acc)
+    return mae * (1.0 + penalty_scale * shortfall)
+
+
+def directional_accuracy(y_true, y_pred):
+    """Fraction of matching signs — None if there's nothing to compare."""
+    if len(y_true) == 0:
+        return None
+    return float(np.mean(np.sign(y_pred) == np.sign(y_true)))
+
+
+def capture_ratio_segments(y_true, y_pred, top_frac=0.2, min_abs=0.05):
+    """'% de movimiento real capturado' (predicho / real, sólo cuando el signo coincide),
+    medido por separado en el top `top_frac` de movimientos reales más grandes vs. el resto.
+    Mejorar el segmento grande típicamente empeora el MAE promedio en el segmento chico/tranquilo
+    — es el trade-off esperado, no una regresión; por eso se trackea separado en vez de un único
+    número agregado. Devuelve (pct_top, pct_rest, n_top, n_rest); None cuando no hay muestra
+    suficiente en ese segmento."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = (np.abs(y_true) >= min_abs) & (np.sign(y_true) == np.sign(y_pred))
+    if mask.sum() < 5:
+        return None, None, int(mask.sum()), 0
+    yt, yp = y_true[mask], y_pred[mask]
+    order = np.argsort(-np.abs(yt))
+    n_top = max(1, int(round(len(yt) * top_frac)))
+    top_idx, rest_idx = order[:n_top], order[n_top:]
+    ratio = np.clip(yp / yt, -5, 5)  # guard against blowups when yt is near the min_abs floor
+    pct_top = float(np.mean(ratio[top_idx]) * 100) if len(top_idx) else None
+    pct_rest = float(np.mean(ratio[rest_idx]) * 100) if len(rest_idx) else None
+    return pct_top, pct_rest, len(top_idx), len(rest_idx)
+
+
 # ── Vectorized feature computation (pandas, per asset) ───────────────────────
 
 def compute_all_features_for_asset(rows):
@@ -1022,6 +1069,8 @@ def _run_lr_training(job_id: str):
             # Target ATR-normalized so model learns in ATR units; inference denormalizes.
             lgbm_model_b64 = lgbm_val_mae = lgbm_importance = None
             lgbm_error_p50 = lgbm_error_p75 = lgbm_error_p90 = None
+            capture_pct_top20 = capture_pct_rest = None
+            capture_n_top20 = capture_n_rest = None
             if horizon_minutes in lgbm_horizon_cache:
                 cached = lgbm_horizon_cache[horizon_minutes]
                 lgbm_model_b64 = cached['model_b64']
@@ -1031,6 +1080,10 @@ def _run_lr_training(job_id: str):
                 lgbm_error_p50 = cached.get('error_p50')
                 lgbm_error_p75 = cached.get('error_p75')
                 lgbm_error_p90 = cached.get('error_p90')
+                capture_pct_top20 = cached.get('capture_pct_top20')
+                capture_pct_rest = cached.get('capture_pct_rest')
+                capture_n_top20 = cached.get('capture_n_top20')
+                capture_n_rest = cached.get('capture_n_rest')
             elif Xs is not None and len(Xs) >= 30:
                 import optuna
                 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -1038,6 +1091,8 @@ def _run_lr_training(job_id: str):
                 atr_idx = LR_FEATURE_NAMES.index('atr_pct')
                 atr_train_raw = np.clip(X_train[train_signed_mask][:, atr_idx], 0.1, 10.0)
                 ys_norm = ys / atr_train_raw
+                # LGBM-only: pay more for missing large moves, on top of the recency weight.
+                ws_lgbm = ws * magnitude_weight(ys)
 
                 val_sm = ~np.isnan(y_signed_val) if len(X_val_s) > 0 else np.zeros(0, dtype=bool)
                 has_val = val_sm.sum() >= 5
@@ -1060,17 +1115,22 @@ def _run_lr_training(job_id: str):
                         objective='regression_l1',
                     )
                     m = lgb.LGBMRegressor(**params)
-                    m.fit(Xs, ys_norm, sample_weight=ws)
+                    m.fit(Xs, ys_norm, sample_weight=ws_lgbm)
                     if has_val:
                         preds_d = m.predict(X_val_s[val_sm]) * atr_val_raw
-                        return float(np.mean(np.abs(y_signed_val[val_sm] - preds_d)))
-                    return float(np.mean(np.abs(ys_norm - m.predict(Xs))))
+                        mae = float(np.mean(np.abs(y_signed_val[val_sm] - preds_d)))
+                        dir_acc = directional_accuracy(y_signed_val[val_sm], preds_d)
+                    else:
+                        preds_tr = m.predict(Xs) * atr_train_raw
+                        mae = float(np.mean(np.abs(ys_norm - m.predict(Xs))))
+                        dir_acc = directional_accuracy(ys, preds_tr)
+                    return lgbm_trial_score(mae, dir_acc)
 
                 study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
                 n_trials = 50 if len(Xs) >= 30 else 25
                 study.optimize(_lgbm_objective, n_trials=n_trials, show_progress_bar=False)
                 best_p = study.best_params
-                print(f'[optuna] H={horizon_minutes} best={best_p} val_mae={study.best_value:.4f}', flush=True)
+                print(f'[optuna] H={horizon_minutes} best={best_p} score={study.best_value:.4f}', flush=True)
 
                 # Train final model with best params + early stopping
                 eval_set_norm = [(X_val_s[val_sm], y_val_norm)] if has_val else None
@@ -1079,7 +1139,7 @@ def _run_lr_training(job_id: str):
                     **best_p, n_estimators=500, random_state=42, verbose=-1,
                     objective='regression_l1',
                 )
-                lgb_reg.fit(Xs, ys_norm, sample_weight=ws, eval_set=eval_set_norm, callbacks=callbacks)
+                lgb_reg.fit(Xs, ys_norm, sample_weight=ws_lgbm, eval_set=eval_set_norm, callbacks=callbacks)
                 if val_sm.sum() > 0:
                     atr_val_raw = np.clip(X_val[:, atr_idx][val_sm], 0.1, 10.0)
                     preds_denorm = lgb_reg.predict(X_val_s[val_sm]) * atr_val_raw
@@ -1088,6 +1148,10 @@ def _run_lr_training(job_id: str):
                     lgbm_error_p50 = float(np.percentile(val_residuals, 50))
                     lgbm_error_p75 = float(np.percentile(val_residuals, 75))
                     lgbm_error_p90 = float(np.percentile(val_residuals, 90))
+                    capture_pct_top20, capture_pct_rest, capture_n_top20, capture_n_rest = \
+                        capture_ratio_segments(y_signed_val[val_sm], preds_denorm)
+                    print(f'[capture] H={horizon_minutes} top20%={capture_pct_top20} (n={capture_n_top20}) '
+                          f'resto={capture_pct_rest} (n={capture_n_rest})', flush=True)
                 lgbm_model_b64 = base64.b64encode(pickle.dumps(lgb_reg)).decode('utf-8')
                 lgbm_importance = dict(zip(LR_FEATURE_NAMES, lgb_reg.feature_importances_.tolist()))
                 lgbm_horizon_cache[horizon_minutes] = {
@@ -1098,6 +1162,10 @@ def _run_lr_training(job_id: str):
                     'error_p50': lgbm_error_p50,
                     'error_p75': lgbm_error_p75,
                     'error_p90': lgbm_error_p90,
+                    'capture_pct_top20': capture_pct_top20,
+                    'capture_pct_rest': capture_pct_rest,
+                    'capture_n_top20': capture_n_top20,
+                    'capture_n_rest': capture_n_rest,
                 }
 
             upserts.append({
@@ -1127,6 +1195,10 @@ def _run_lr_training(job_id: str):
                 'error_p50': lgbm_error_p50,
                 'error_p75': lgbm_error_p75,
                 'error_p90': lgbm_error_p90,
+                'capture_pct_top20': capture_pct_top20,
+                'capture_pct_rest': capture_pct_rest,
+                'capture_n_top20': capture_n_top20,
+                'capture_n_rest': capture_n_rest,
             })
             results[f'{model_name}:{horizon_minutes}'] = {
                 'samples': len(X_tv), 'accuracy': round(accuracy, 3),
@@ -1230,6 +1302,7 @@ def _run_lr_training(job_id: str):
 
             atr_tr = np.clip(X_tr[tr_mask][:, atr_idx], 0.1, 10.0)
             ys_norm_s = ys_s / atr_tr
+            ws_s_lgbm = ws_s * magnitude_weight(ys_s)
 
             X_v_s = scaler_s.transform(X_v) if len(X_v) > 0 else np.empty((0, X_tr.shape[1]))
             val_sm_s = ~np.isnan(y_v) if len(X_v) > 0 else np.zeros(0, dtype=bool)
@@ -1245,7 +1318,7 @@ def _run_lr_training(job_id: str):
                 random_state=42, verbose=-1,
                 objective='regression_l1',
             )
-            lgb_s.fit(Xs_s, ys_norm_s, sample_weight=ws_s, eval_set=eval_set_s, callbacks=cbs)
+            lgb_s.fit(Xs_s, ys_norm_s, sample_weight=ws_s_lgbm, eval_set=eval_set_s, callbacks=cbs)
 
             sess_val_mae = None
             sess_ep25 = sess_ep50 = sess_ep75 = sess_ep90 = None
@@ -1349,6 +1422,7 @@ def _run_lr_training(job_id: str):
             ys_t = y_tr[tm]; ws_t = w_tr[tm]
             atr_t = np.clip(X_tr[tm][:, atr_idx], 0.1, 10.0)
             ys_tn = ys_t / atr_t
+            ws_t_lgbm = ws_t * magnitude_weight(ys_t)
 
             X_v_t = sc_t.transform(X_v) if len(X_v) > 0 else np.empty((0, X_tr.shape[1]))
             vm_t = ~np.isnan(y_v) if len(X_v) > 0 else np.zeros(0, dtype=bool)
@@ -1363,7 +1437,7 @@ def _run_lr_training(job_id: str):
                 min_child_samples=5, subsample=0.8, colsample_bytree=0.8,
                 random_state=42, verbose=-1, objective='regression_l1',
             )
-            lgb_t.fit(Xs_t, ys_tn, sample_weight=ws_t, eval_set=eval_t, callbacks=cbs_t)
+            lgb_t.fit(Xs_t, ys_tn, sample_weight=ws_t_lgbm, eval_set=eval_t, callbacks=cbs_t)
 
             t_val_mae = None
             if vm_t.sum() > 0:
@@ -1453,6 +1527,7 @@ def _run_lr_training(job_id: str):
             ys_c = y_tr[tm]; ws_c = w_tr[tm]
             atr_c = np.clip(X_tr[tm][:, atr_idx], 0.1, 10.0)
             ys_cn = ys_c / atr_c
+            ws_c_lgbm = ws_c * magnitude_weight(ys_c)
 
             X_v_c = sc_c.transform(X_v) if len(X_v) > 0 else np.empty((0, X_tr.shape[1]))
             vm_c = ~np.isnan(y_v) if len(X_v) > 0 else np.zeros(0, dtype=bool)
@@ -1467,7 +1542,7 @@ def _run_lr_training(job_id: str):
                 min_child_samples=10, subsample=0.8, colsample_bytree=0.8,
                 random_state=42, verbose=-1, objective='regression_l1',
             )
-            lgb_c.fit(Xs_c, ys_cn, sample_weight=ws_c, eval_set=eval_c, callbacks=cbs_c)
+            lgb_c.fit(Xs_c, ys_cn, sample_weight=ws_c_lgbm, eval_set=eval_c, callbacks=cbs_c)
 
             c_val_mae = None
             if vm_c.sum() > 0:
@@ -2244,9 +2319,16 @@ def _run_lr_training_daily(job_id: str):
             atr_tr_valid = np.clip(atr_train[tm], 0.1, 20.0)
             atr_train_mean = float(np.mean(atr_tr_valid))
             y_train_norm = y_train / atr_train  # shape matches y_train; NaN rows excluded by tm mask
+            # LGBM-only: pay more for missing large moves, on top of the recency/reliability weight.
+            w_train_lgbm = w_train * magnitude_weight(y_train)
 
             # Paso C: LightGBM daily — Optuna-tuned hyperparams + early stopping
+            # (all pre-declared: tm.sum() in [20,30) skips the block below but the upsert dict
+            # further down still references these names — pre-existing gap, not touching the
+            # 20-sample floor itself, just making sure it doesn't NameError on that gap.)
             lgbm_model_b64 = lgbm_val_mae = None
+            lgbm_error_p25 = lgbm_error_p50 = lgbm_error_p75 = lgbm_error_p90 = None
+            capture_pct_top20 = capture_pct_rest = capture_n_top20 = capture_n_rest = None
             if tm.sum() >= 30:
                 import optuna as _optuna
                 _optuna.logging.set_verbosity(_optuna.logging.WARNING)
@@ -2267,13 +2349,17 @@ def _run_lr_training_daily(job_id: str):
                         objective='regression_l1',
                     )
                     m = lgb.LGBMRegressor(**p)
-                    m.fit(X_train_s[tm], y_train_norm[tm], sample_weight=w_train[tm])
+                    m.fit(X_train_s[tm], y_train_norm[tm], sample_weight=w_train_lgbm[tm])
                     if has_val_d:
-                        # evaluate in real % (denormalize) so MAE is comparable
+                        # evaluate in real % (denormalize) so MAE/dir-acc are comparable
                         pred_real = m.predict(X_val_s[vm]) * atr_val_valid
-                        return float(np.mean(np.abs(y_val[vm] - pred_real)))
-                    pred_real_tr = m.predict(X_train_s[tm]) * atr_tr_valid
-                    return float(np.mean(np.abs(y_train[tm] - pred_real_tr)))
+                        mae = float(np.mean(np.abs(y_val[vm] - pred_real)))
+                        dir_acc = directional_accuracy(y_val[vm], pred_real)
+                    else:
+                        pred_real_tr = m.predict(X_train_s[tm]) * atr_tr_valid
+                        mae = float(np.mean(np.abs(y_train[tm] - pred_real_tr)))
+                        dir_acc = directional_accuracy(y_train[tm], pred_real_tr)
+                    return lgbm_trial_score(mae, dir_acc)
 
                 _study_d = _optuna.create_study(
                     direction='minimize', sampler=_optuna.samplers.TPESampler(seed=42)
@@ -2281,7 +2367,7 @@ def _run_lr_training_daily(job_id: str):
                 _n_trials_d = 50 if int(tm.sum()) >= 30 else 25
                 _study_d.optimize(_lgbm_daily_obj, n_trials=_n_trials_d, show_progress_bar=False)
                 best_p_d = _study_d.best_params
-                print(f'[optuna_daily] H={bucket} best={best_p_d} val_mae={_study_d.best_value:.4f}', flush=True)
+                print(f'[optuna_daily] H={bucket} best={best_p_d} score={_study_d.best_value:.4f}', flush=True)
 
                 # Eval set uses ATR-normalized targets so early stopping monitors normalized loss
                 eval_set_d = [(X_val_s[vm], y_val[vm] / atr_val_valid)] if has_val_d else None
@@ -2290,7 +2376,7 @@ def _run_lr_training_daily(job_id: str):
                     **best_p_d, n_estimators=600, random_state=42, verbose=-1,
                     objective='regression_l1',
                 )
-                lgb_reg.fit(X_train_s[tm], y_train_norm[tm], sample_weight=w_train[tm],
+                lgb_reg.fit(X_train_s[tm], y_train_norm[tm], sample_weight=w_train_lgbm[tm],
                             eval_set=eval_set_d, callbacks=callbacks_d)
                 if vm.sum() > 0:
                     # Denormalize predictions to get real % MAE
@@ -2301,8 +2387,13 @@ def _run_lr_training_daily(job_id: str):
                     lgbm_error_p50 = float(np.percentile(val_residuals, 50))
                     lgbm_error_p75 = float(np.percentile(val_residuals, 75))
                     lgbm_error_p90 = float(np.percentile(val_residuals, 90))
+                    capture_pct_top20, capture_pct_rest, capture_n_top20, capture_n_rest = \
+                        capture_ratio_segments(y_val[vm], val_preds_real)
+                    print(f'[capture_daily] H={bucket} top20%={capture_pct_top20} (n={capture_n_top20}) '
+                          f'resto={capture_pct_rest} (n={capture_n_rest})', flush=True)
                 else:
                     lgbm_error_p25 = lgbm_error_p50 = lgbm_error_p75 = lgbm_error_p90 = None
+                    capture_pct_top20 = capture_pct_rest = capture_n_top20 = capture_n_rest = None
                 lgbm_model_b64 = base64.b64encode(pickle.dumps(lgb_reg)).decode('utf-8')
 
             upserts.append({
@@ -2326,6 +2417,10 @@ def _run_lr_training_daily(job_id: str):
                 'error_p90': lgbm_error_p90,
                 'atr_normalized': True,
                 'atr_train_mean': round(atr_train_mean, 4),
+                'capture_pct_top20': capture_pct_top20,
+                'capture_pct_rest': capture_pct_rest,
+                'capture_n_top20': capture_n_top20,
+                'capture_n_rest': capture_n_rest,
             })
             job['models_done'] += 1
             print(
@@ -2361,6 +2456,7 @@ def _run_lr_training_daily(job_id: str):
                 cl_ytr = apply_beta_adj(cl_y[:split_cl], cl_spy[:split_cl], cl_beta)
                 cl_yvl = apply_beta_adj(cl_y[split_cl:], cl_spy[split_cl:], cl_beta)
                 cl_wtr = cl_w[:split_cl]
+                cl_wtr_lgbm = cl_wtr * magnitude_weight(cl_ytr)
                 scaler_cl = StandardScaler()
                 cl_Xtr_s = scaler_cl.fit_transform(cl_Xtr)
                 cl_Xvl_s = scaler_cl.transform(cl_Xvl) if len(cl_Xvl) > 0 else np.empty((0, cl_Xtr.shape[1]))
@@ -2369,7 +2465,7 @@ def _run_lr_training_daily(job_id: str):
                 if tm_cl.sum() < 30:
                     continue
 
-                def _cl_obj(trial, Xtr=cl_Xtr_s, ytr=cl_ytr, wtr=cl_wtr, Xvl=cl_Xvl_s, yvl=cl_yvl, tmk=tm_cl, vmk=vm_cl):
+                def _cl_obj(trial, Xtr=cl_Xtr_s, ytr=cl_ytr, wtr=cl_wtr_lgbm, Xvl=cl_Xvl_s, yvl=cl_yvl, tmk=tm_cl, vmk=vm_cl):
                     p = dict(
                         num_leaves=trial.suggest_int('num_leaves', 15, 63),
                         learning_rate=trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
@@ -2384,8 +2480,14 @@ def _run_lr_training_daily(job_id: str):
                     m = lgb.LGBMRegressor(**p)
                     m.fit(Xtr[tmk], ytr[tmk], sample_weight=wtr[tmk])
                     if vmk.sum() >= 5:
-                        return float(np.mean(np.abs(yvl[vmk] - m.predict(Xvl[vmk]))))
-                    return float(np.mean(np.abs(ytr[tmk] - m.predict(Xtr[tmk]))))
+                        preds = m.predict(Xvl[vmk])
+                        mae = float(np.mean(np.abs(yvl[vmk] - preds)))
+                        dir_acc = directional_accuracy(yvl[vmk], preds)
+                    else:
+                        preds = m.predict(Xtr[tmk])
+                        mae = float(np.mean(np.abs(ytr[tmk] - preds)))
+                        dir_acc = directional_accuracy(ytr[tmk], preds)
+                    return lgbm_trial_score(mae, dir_acc)
 
                 _study_cl = _optuna_cl.create_study(direction='minimize', sampler=_optuna_cl.samplers.TPESampler(seed=42))
                 _study_cl.optimize(_cl_obj, n_trials=25, show_progress_bar=False)
@@ -2393,7 +2495,7 @@ def _run_lr_training_daily(job_id: str):
                 lgb_cl = lgb.LGBMRegressor(**best_cl, n_estimators=600, random_state=42, verbose=-1, objective='regression_l1')
                 eval_cl = [(cl_Xvl_s[vm_cl], cl_yvl[vm_cl])] if vm_cl.sum() >= 5 else None
                 cbs_cl = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)] if eval_cl else None
-                lgb_cl.fit(cl_Xtr_s[tm_cl], cl_ytr[tm_cl], sample_weight=cl_wtr[tm_cl], eval_set=eval_cl, callbacks=cbs_cl)
+                lgb_cl.fit(cl_Xtr_s[tm_cl], cl_ytr[tm_cl], sample_weight=cl_wtr_lgbm[tm_cl], eval_set=eval_cl, callbacks=cbs_cl)
                 cl_val_mae = float(np.mean(np.abs(cl_yvl[vm_cl] - lgb_cl.predict(cl_Xvl_s[vm_cl])))) if vm_cl.sum() > 0 else None
                 cl_b64 = base64.b64encode(pickle.dumps(lgb_cl)).decode('utf-8')
                 cluster_upserts.append({
