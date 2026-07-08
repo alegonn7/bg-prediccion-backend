@@ -536,6 +536,36 @@ def _run_lr_training(job_id: str):
                 flush=True,
             )
 
+        # Bootstrap 'lgbm'/'ridge' under their canonical D4 vote names (backlog fix, post
+        # Etapa 12). model_learned_params_intraday is keyed by (model_name, horizon_minutes)
+        # from the legacy 13-strategy schema — 'lgbm'/'ridge' never existed as historical
+        # model_names before crear-prediccion-intraday started asking for them (Etapa 4), so
+        # they can never appear via the grouping above: a catch-22 where the vote can't fire
+        # without a trained row, and no row gets trained without the vote having fired first.
+        # The X/y pairs are identical across model_names for the same horizon (indicators +
+        # actual outcome, independent of which named strategy logged the guess — see the LGBM
+        # dedup cache above), so cloning an existing horizon's trained artifacts under the
+        # canonical names isn't fabricating a different model, just exposing the one already
+        # trained under the name the new roster looks up. Self-healing: once the votes fire for
+        # real, future runs group genuine 'lgbm'/'ridge' rows and this stops being needed.
+        upserted_keys = {(u['model_name'], u['horizon_minutes']) for u in upserts}
+        by_horizon: dict = defaultdict(list)
+        for u in upserts:
+            by_horizon[u['horizon_minutes']].append(u)
+        for horizon_minutes, group_upserts in by_horizon.items():
+            for canonical, needs_field in (('lgbm', 'lgbm_model'), ('ridge', 'signed_coefficients')):
+                if (canonical, horizon_minutes) in upserted_keys:
+                    continue
+                candidates = [u for u in group_upserts if u.get(needs_field)]
+                if not candidates:
+                    continue
+                template = max(candidates, key=lambda u: u['train_samples'])
+                clone = dict(template)
+                clone['model_name'] = canonical
+                upserts.append(clone)
+                print(f'[lr_train] bootstrap {canonical}:{horizon_minutes} cloned from '
+                      f'{template["model_name"]} (n={template["train_samples"]})', flush=True)
+
         for u in upserts:
             sb.rpc('upsert_lr_params', {'p_params': [u]}).execute()
 
