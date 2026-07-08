@@ -92,6 +92,26 @@ def capture_ratio_segments(y_true, y_pred, top_frac=0.2, min_abs=0.05):
     return pct_top, pct_rest, len(top_idx), len(rest_idx)
 
 
+# ── Flask app ─────────────────────────────────────────────────────────────────
+
+app = Flask(__name__)
+
+
+def _check_secret() -> bool:
+    if not INTERNAL_SECRET:
+        return False
+    secret = request.headers.get('x-internal-secret', '')
+    return secret == INTERNAL_SECRET
+
+
+@app.after_request
+def _cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'content-type, authorization, x-internal-secret'
+    return response
+
+
 # ── LR Intraday Training ──────────────────────────────────────────────────────
 
 LR_FEATURE_NAMES = [
