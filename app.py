@@ -268,16 +268,23 @@ def _run_lr_training(job_id: str):
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
         job['status'] = 'fetching'
-        # PostgREST caps at 1000 rows/request — paginate in 1000-row chunks.
-        # SQL function has 90-day filter + LIMIT 15000.
+        # get_intraday_training_data() is plpgsql (not inlinable) — PostgREST's .range()
+        # re-runs the whole function (join+sort+limit 15000) per page instead of pushing
+        # OFFSET/LIMIT into the query, so paginating in 1000-row chunks meant re-executing
+        # the expensive query up to 16x per job. Fixed by pushing p_limit into the function
+        # itself (same pattern as get_daily_training_data) and fetching in one call — with
+        # a couple of retries since a single call can still hit transient DB contention.
         all_rows = []
-        batch_size = 1000
-        for offset in range(0, 15001, batch_size):
-            resp = sb.rpc('get_intraday_training_data').range(offset, offset + batch_size - 1).execute()
-            batch = resp.data or []
-            all_rows.extend(batch)
-            if len(batch) < batch_size:
+        for attempt in range(3):
+            try:
+                resp = sb.rpc('get_intraday_training_data', {'p_limit': 15000}).execute()
+                all_rows = resp.data or []
                 break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                print(f'[lr_train] fetch attempt {attempt + 1} failed: {e} — retrying', flush=True)
+                time.sleep(5 * (attempt + 1))
         print(f'[lr_train] fetched {len(all_rows)} rows', flush=True)
 
         job['total_samples'] = len(all_rows)
