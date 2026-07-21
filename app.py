@@ -2213,14 +2213,15 @@ def predict_lgbm_daily():
         # Etapa 17 (backlog): a horizontes largos (visto sobre todo en 60/90d, peor en modelos
         # 'cluster' — muestra de entrenamiento más chica que el global) el modelo ocasionalmente
         # extrapola muy por fuera de lo que él mismo considera típico para este bucket — casos
-        # reales vistos: +95.84% a 90d con avg_actual_mag=20.2% (4.7x), universo completo con
-        # máximos de hasta 420% a 90d. No es un fix de la causa (no se investigó por qué el modelo
-        # extrapola así — candidatos: overfitting en clusters con pocas muestras, falta de
-        # regularización a horizontes largos) — es un piso de sanidad basado en la propia
-        # calibración del modelo (avg_actual_mag, dato real medido en entrenamiento, no un número
-        # inventado): nunca deja que una sola predicción supere 5x lo que el modelo mismo considera
-        # el movimiento promedio real para ese horizonte. Ver REDISENO/STATUS.md.
-        MAG_CLAMP_MULT = 5.0
+        # reales vistos: +95.84% a 90d con avg_actual_mag=20.2% (4.7x — el caso que motivó este
+        # fix), universo completo con máximos de hasta 420% a 90d. No es un fix de la causa (no se
+        # investigó por qué el modelo extrapola así — candidatos: overfitting en clusters con pocas
+        # muestras, falta de regularización a horizontes largos) — es un piso de sanidad basado en
+        # la propia calibración del modelo (avg_actual_mag, dato real medido en entrenamiento, no
+        # un número inventado). 3x (no 5x — con 5x el caso real de arriba, 4.7x, casi no se hubiera
+        # tocado, que es exactamente lo que este fix tiene que evitar) sigue siendo generoso: ya es
+        # más que el promedio real de movimiento en ese horizonte. Ver REDISENO/STATUS.md.
+        MAG_CLAMP_MULT = 3.0
         mag_cap = MAG_CLAMP_MULT * avg_mag
         pred_clamped = max(-mag_cap, min(mag_cap, pred))
         return jsonify({
