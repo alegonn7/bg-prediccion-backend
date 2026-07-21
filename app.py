@@ -2210,9 +2210,23 @@ def predict_lgbm_daily():
             raw = float(g_model.predict(g_scaler.transform(X))[0])
             pred = (raw * current_atr if g_atr_norm else raw) + g_beta * spy_pct
             model_used = 'global'
+        # Etapa 17 (backlog): a horizontes largos (visto sobre todo en 60/90d, peor en modelos
+        # 'cluster' — muestra de entrenamiento más chica que el global) el modelo ocasionalmente
+        # extrapola muy por fuera de lo que él mismo considera típico para este bucket — casos
+        # reales vistos: +95.84% a 90d con avg_actual_mag=20.2% (4.7x), universo completo con
+        # máximos de hasta 420% a 90d. No es un fix de la causa (no se investigó por qué el modelo
+        # extrapola así — candidatos: overfitting en clusters con pocas muestras, falta de
+        # regularización a horizontes largos) — es un piso de sanidad basado en la propia
+        # calibración del modelo (avg_actual_mag, dato real medido en entrenamiento, no un número
+        # inventado): nunca deja que una sola predicción supere 5x lo que el modelo mismo considera
+        # el movimiento promedio real para ese horizonte. Ver REDISENO/STATUS.md.
+        MAG_CLAMP_MULT = 5.0
+        mag_cap = MAG_CLAMP_MULT * avg_mag
+        pred_clamped = max(-mag_cap, min(mag_cap, pred))
         return jsonify({
             'ok': True,
-            'predicted_pct': round(pred, 4),
+            'predicted_pct': round(pred_clamped, 4),
+            'predicted_pct_raw': round(pred, 4) if pred_clamped != pred else None,
             'horizon_bucket': int(horizon_bucket),
             'avg_actual_mag': round(avg_mag, 4),
             'model_used': model_used,
