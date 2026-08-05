@@ -1416,6 +1416,8 @@ DAILY_FEATURE_NAMES = [
     'earnings_days_norm',
     # VIX regime interactions (3) — derived, no extra SQL needed
     'vix_x_rsi', 'vix_x_momentum', 'vix_x_score_macro',
+    # Etapa 23: par USD↔ARS (CEDEARs y acciones argentinas locales) — 0 para todo lo demás (3)
+    'underlying_pred_norm', 'underlying_conf_norm', 'ccl_momentum_norm',
 ]
 
 
@@ -1475,6 +1477,16 @@ def _extract_daily_features(row: dict) -> list:
     rsi_n    = (rsi - 50) / 25
     roc20_n  = cl3(roc20 / 20)
     sc_macro_n = cl3(sc_macro)
+    # Etapa 23: predicción USD del subyacente (mismo horizonte) + momentum del CCL. Ausentes para
+    # cualquier ticker sin par (todo lo que no sea cedear_arg/accion_arg_local) → quedan en 0, sin
+    # efecto en esos modelos. Presentes sólo cuando quien arma `row` los agrega explícitamente
+    # (crear-prediccion vía indicators, o el enrichment de get_daily_training_data en Python).
+    underlying_pred = row.get('underlying_pred_pct')
+    underlying_conf = row.get('underlying_pred_conf')
+    ccl_mom         = row.get('ccl_momentum_5d')
+    underlying_pred_norm = cl3(float(underlying_pred) / 5) if underlying_pred is not None else 0.0
+    underlying_conf_norm = cl3((float(underlying_conf) - 0.5) * 2, -1.0, 1.0) if underlying_conf is not None else 0.0
+    ccl_momentum_norm    = cl3(float(ccl_mom) / 3) if ccl_mom is not None else 0.0
     return [
         # Price vs MA (3)
         cl3(vs20 / 5), cl3(vs50 / 10), cl3(vs200 / 20),
@@ -1519,10 +1531,101 @@ def _extract_daily_features(row: dict) -> list:
         cl3(vix_n * rsi_n),
         cl3(vix_n * roc20_n),
         cl3(vix_n * sc_macro_n),
+        # Etapa 23: par USD↔ARS (3)
+        underlying_pred_norm, underlying_conf_norm, ccl_momentum_norm,
     ]
 
 
 daily_training_jobs: dict = {}
+
+
+def _enrich_underlying_pair_features(sb, rows: list) -> None:
+    """Etapa 23: para filas reales de tickers con par USD↔ARS (cedear_arg/accion_arg_local),
+    agrega 'underlying_pred_pct'/'underlying_pred_conf'/'ccl_momentum_5d' con el valor real que
+    existía en ese momento (as-of, no lookahead: la predicción USD más reciente con
+    created_at <= la de esta fila real, mismo horizon_bucket). Muta `rows` in place. Tickers sin
+    par, o fechas sin muestra as-of disponible, quedan sin estas keys — _extract_daily_features ya
+    los trata como 0 vía row.get(..., None)."""
+    a_resp = sb.from_('assets').select('id, ticker, underlying_ticker').not_.is_('underlying_ticker', 'null').execute()
+    pair_assets = a_resp.data or []
+    if not pair_assets:
+        return
+    underlying_ticker_of = {a['ticker']: a['underlying_ticker'] for a in pair_assets}
+    tickers_with_pair = set(underlying_ticker_of.keys())
+    relevant_rows = [r for r in rows if r.get('ticker') in tickers_with_pair]
+    if not relevant_rows:
+        return
+
+    underlying_tickers = set(underlying_ticker_of.values())
+    u_resp = sb.from_('assets').select('id, ticker').in_('ticker', list(underlying_tickers)).execute()
+    underlying_id_of = {a['ticker']: a['id'] for a in (u_resp.data or [])}
+
+    cp_resp = sb.from_('consensus_predictions') \
+        .select('asset_id, horizon_days, created_at, final_pct_predicted, confidence') \
+        .in_('asset_id', list(underlying_id_of.values())) \
+        .order('created_at').execute()
+    cp_rows = cp_resp.data or []
+    # (underlying_ticker, horizon_bucket) -> lista ordenada de (created_at, pct, conf)
+    id_to_ticker = {v: k for k, v in underlying_id_of.items()}
+    cp_series: dict = {}
+    for r in cp_rows:
+        t = id_to_ticker.get(r['asset_id'])
+        if not t:
+            continue
+        key = (t, int(r['horizon_days']))
+        cp_series.setdefault(key, []).append((r['created_at'], r['final_pct_predicted'], r['confidence']))
+
+    ccl_resp = sb.from_('dolar_ccl_history').select('fecha, venta').order('fecha').execute()
+    ccl_rows = [(r['fecha'], float(r['venta'])) for r in (ccl_resp.data or []) if r.get('venta') is not None]
+
+    def _as_of(series: list, ts: str):
+        # series ya viene ordenada por created_at asc — busca la última entrada <= ts.
+        best = None
+        for entry_ts, *_rest in series:
+            if entry_ts <= ts:
+                best = entry_ts, *_rest
+            else:
+                break
+        return best
+
+    ccl_dates = [d for d, _ in ccl_rows]
+    ccl_vals  = [v for _, v in ccl_rows]
+
+    def _ccl_momentum_as_of(date_str: str):
+        # último índice con fecha <= date_str
+        idx = None
+        for i, d in enumerate(ccl_dates):
+            if str(d) <= date_str[:10]:
+                idx = i
+            else:
+                break
+        if idx is None or idx < 5:
+            return None
+        base = ccl_vals[idx - 5]
+        if not base:
+            return None
+        return (ccl_vals[idx] - base) / base * 100
+
+    enriched = 0
+    for r in relevant_rows:
+        u_ticker = underlying_ticker_of.get(r['ticker'])
+        h = int(r.get('horizon_bucket') or 0)
+        ts = r.get('created_at')
+        if not u_ticker or not h or not ts:
+            continue
+        series = cp_series.get((u_ticker, h))
+        if series:
+            hit = _as_of(series, ts)
+            if hit:
+                _, pct, conf = hit
+                r['underlying_pred_pct']  = pct
+                r['underlying_pred_conf'] = conf
+        ccl_mom = _ccl_momentum_as_of(ts)
+        if ccl_mom is not None:
+            r['ccl_momentum_5d'] = ccl_mom
+        if 'underlying_pred_pct' in r or 'ccl_momentum_5d' in r:
+            enriched += 1
+    print(f'[lr_train_daily] Etapa 23: {enriched}/{len(relevant_rows)} filas con par enriquecidas con dato real as-of', flush=True)
 
 
 def _run_lr_training_daily(job_id: str):
@@ -1558,6 +1661,10 @@ def _run_lr_training_daily(job_id: str):
         resp = sb.rpc('get_daily_training_data', {'p_limit': 100000}).execute()
         real_rows = resp.data or []
         print(f'[lr_train_daily] fetched {len(real_rows)} real rows', flush=True)
+        try:
+            _enrich_underlying_pair_features(sb, real_rows)
+        except Exception as e:
+            print(f'[lr_train_daily] Etapa 23 enrichment failed (non-fatal, features default to 0): {e}', flush=True)
 
         # Build historical samples from price_history (walk-forward, no lookahead)
         hist_samples = _build_historical_samples(sb)
