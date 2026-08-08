@@ -178,6 +178,33 @@ TICKER_CLUSTERS: dict = {
     'DIA': 'macro_etf', 'GLD': 'macro_etf', 'GDX': 'macro_etf',
     'EEM': 'macro_etf', 'TLT': 'macro_etf', 'IEF': 'macro_etf',
     'HYG': 'macro_etf', 'USO': 'macro_etf',
+    # arg_ars: TODO lo que cotiza en pesos en BYMA (33 CEDEARs + 20 acciones argentinas).
+    # Van juntos a propósito, aunque un CEDEAR siga a una empresa extranjera y una acción local a
+    # una argentina: lo que comparten es estar denominados en pesos, o sea que arrastran el
+    # componente cambiario y la liquidez de BYMA. Eso es exactamente lo que el modelo global —
+    # entrenado casi todo con datos de EEUU — no puede capturar.
+    # Motivo concreto de este cluster (ver STATUS.md, sesión del 08/08/2026): las 3 features de la
+    # Etapa 23 (underlying_pred_norm, underlying_conf_norm, ccl_momentum_norm) quedaron con
+    # coeficiente EXACTAMENTE 0 en el modelo global, porque sólo valen distinto de cero en el 0,8%
+    # de las muestras (649 filas en pesos contra ~79.000 totales) y la regularización las anula.
+    # En un modelo entrenado sólo con instrumentos en pesos tienen valor real en el 100% de las
+    # muestras, así que recién ahí el modelo puede aprender cuánto pesa la predicción en dólares.
+    # OJO: separarlos en dos clusters (CEDEAR vs acción local) parte la muestra al medio y ninguno
+    # llegaría al mínimo de 50 — reevaluar cuando haya bastante más histórico cerrado.
+    'MU.BA': 'arg_ars', 'MSFT.BA': 'arg_ars', 'MELI.BA': 'arg_ars', 'SNDK.BA': 'arg_ars',
+    'NVDA.BA': 'arg_ars', 'SPY.BA': 'arg_ars', 'GOOGL.BA': 'arg_ars', 'NU.BA': 'arg_ars',
+    'QQQ.BA': 'arg_ars', 'IBM.BA': 'arg_ars', 'AMZN.BA': 'arg_ars', 'ORCL.BA': 'arg_ars',
+    'AMD.BA': 'arg_ars', 'PLTR.BA': 'arg_ars', 'TSLA.BA': 'arg_ars', 'MSTR.BA': 'arg_ars',
+    'AAPL.BA': 'arg_ars', 'NBIS.BA': 'arg_ars', 'INTC.BA': 'arg_ars', 'GLD.BA': 'arg_ars',
+    'KO.BA': 'arg_ars', 'BRKB.BA': 'arg_ars', 'ASTS.BA': 'arg_ars', 'SATL.BA': 'arg_ars',
+    'EWZ.BA': 'arg_ars', 'MCD.BA': 'arg_ars', 'V.BA': 'arg_ars', 'JPM.BA': 'arg_ars',
+    'UBER.BA': 'arg_ars', 'GLOB.BA': 'arg_ars', 'NFLX.BA': 'arg_ars', 'META.BA': 'arg_ars',
+    'VIST.BA': 'arg_ars',
+    'YPFD.BA': 'arg_ars', 'GGAL.BA': 'arg_ars', 'PAMP.BA': 'arg_ars', 'BMA.BA': 'arg_ars',
+    'BBAR.BA': 'arg_ars', 'TGSU2.BA': 'arg_ars', 'SUPV.BA': 'arg_ars', 'CEPU.BA': 'arg_ars',
+    'LOMA.BA': 'arg_ars', 'TECO2.BA': 'arg_ars', 'TXAR.BA': 'arg_ars', 'TRAN.BA': 'arg_ars',
+    'BYMA.BA': 'arg_ars', 'EDN.BA': 'arg_ars', 'METR.BA': 'arg_ars', 'VALO.BA': 'arg_ars',
+    'ECOG.BA': 'arg_ars', 'TGNO4.BA': 'arg_ars', 'CRES.BA': 'arg_ars', 'COME.BA': 'arg_ars',
 }
 
 
