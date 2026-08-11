@@ -2526,74 +2526,136 @@ def predict_lgbm_intraday():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
+def _predict_lgbm_one(indicators: dict, ticker: str, models, session_models,
+                      ticker_models, cluster_models) -> dict:
+    """Etapa 29.3 — el núcleo de predict_lgbm_all, extraído para que el endpoint batch no
+    duplique la lógica de prioridad ticker > cluster > sesión > global ni recargue los modelos
+    una vez por activo. Devuelve {predictions, session, ticker_models_used, cluster_models_used}."""
+    indicators = _enrich_indicators(indicators)
+    X = np.array([[float(indicators.get(fn) or 0) for fn in LR_FEATURE_NAMES]])
+    atr_idx = LR_FEATURE_NAMES.index('atr_pct')
+    atr_scale = max(0.1, float(X[0, atr_idx]))
+    spy_r15 = float(indicators.get('spy_return_15m') or 0)
+    mso = float(indicators.get('minutes_since_open') or 0)
+    session = _get_market_session(mso)
+    cluster = TICKER_CLUSTERS.get(ticker, '') if ticker else ''
+    ticker_used = cluster_used = 0
+    predictions = {}
+    for key, (global_m, global_beta) in models.items():
+        # Priority: ticker (blended w/ cluster if data-starved) > cluster > session > global
+        horizon = key.split(':')[1]
+        t_key = f'{ticker}:{horizon}' if ticker else None
+        c_key = f'{cluster}:{horizon}' if cluster else None
+        blended = False
+        if t_key and t_key in ticker_models:
+            t_model, t_beta, t_n = ticker_models[t_key]
+            ticker_used += 1
+            if c_key and c_key in cluster_models and t_n < 200:
+                # Continuous blend: weight ticker by its sample richness
+                c_model, c_beta = cluster_models[c_key]
+                w_t = t_n / 200.0
+                pred_t = _lgbm_predict(t_model, X) * atr_scale + t_beta * spy_r15
+                pred_c = _lgbm_predict(c_model, X) * atr_scale + c_beta * spy_r15
+                predictions[key] = round(w_t * pred_t + (1.0 - w_t) * pred_c, 4)
+                blended = True
+            else:
+                m, beta = t_model, t_beta
+        elif c_key and c_key in cluster_models:
+            m, beta = cluster_models[c_key]
+            cluster_used += 1
+        else:
+            # New storage: '__session__:horizon:session'; old rows keyed by model_name
+            sess_key = f'__session__:{horizon}:{session}'
+            sess_entry = session_models.get(sess_key) or session_models.get(f'{key}:{session}')
+            if sess_entry:
+                m, beta = sess_entry
+            else:
+                m, beta = global_m, global_beta
+        if not blended:
+            pred_idio = _lgbm_predict(m, X) * atr_scale
+            predictions[key] = round(pred_idio + beta * spy_r15, 4)
+    return {
+        'predictions': predictions,
+        'session': session,
+        'ticker_models_used': ticker_used,
+        'cluster_models_used': cluster_used,
+    }
+
+
 @app.route('/api/predict_lgbm_all', methods=['POST', 'OPTIONS'])
 def predict_lgbm_all():
-    """Batch LightGBM inference — all (model, horizon) pairs in one call.
-    Called once per asset by the edge function to avoid 39 individual HTTP requests."""
+    """LightGBM para UN activo, todos los (modelo, horizonte) en una llamada.
+    Etapa 29.3: conservado por compatibilidad — crear-prediccion-intraday ahora usa
+    /api/predict_lgbm_batch, que hace lo mismo para los ~78 activos de una sola vez."""
     if request.method == 'OPTIONS':
         return '', 200
     if not _check_secret():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
     body = request.get_json() or {}
-    indicators = body.get('indicators', {})
-    ticker = body.get('ticker', '')
     try:
         models = _load_lgbm_models_cached()
         if not models:
             return jsonify({'ok': True, 'predictions': {}, 'models_loaded': 0})
-        indicators = _enrich_indicators(indicators)
-        X = np.array([[float(indicators.get(fn) or 0) for fn in LR_FEATURE_NAMES]])
-        atr_idx = LR_FEATURE_NAMES.index('atr_pct')
-        atr_scale = max(0.1, float(X[0, atr_idx]))
-        spy_r15 = float(indicators.get('spy_return_15m') or 0)
+        out = _predict_lgbm_one(
+            body.get('indicators', {}), body.get('ticker', ''), models,
+            _load_lgbm_session_models_cached(), _load_lgbm_ticker_models_cached(),
+            _load_lgbm_cluster_models_cached())
+        return jsonify({'ok': True, 'models_loaded': len(models), **out})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/predict_lgbm_batch', methods=['POST', 'OPTIONS'])
+def predict_lgbm_batch():
+    """Etapa 29.3 — LightGBM para TODOS los activos de la corrida en una sola llamada.
+
+    Por qué existe. crear-prediccion-intraday hacía una llamada HTTP por activo con
+    AbortSignal.timeout(6000): 78 activos en tandas de 15 contra un free tier de un solo worker.
+    La mayoría timeouteaba y el `catch { return {} }` lo convertía en "este activo no tiene voto
+    lgbm", sin dejar rastro. Medido: el 10/08 se crearon 16 filas de lgbm contra 5.226 de ridge
+    (0,3%), y el 07/08 CERO — siendo lgbm el único voto intradiario con acierto real (63-65% a 60
+    y 120 min). O sea el mejor voto del roster estaba efectivamente apagado por un timeout.
+
+    Entrada: {"assets": [{"ticker": "...", "indicators": {...}}, ...]}
+    Salida:  {"ok": true, "results": {"<ticker>": {"predictions": {...}, ...}}, "failed": {...}}
+
+    Los modelos se cargan UNA vez para todo el lote. Un activo que falla no tumba el lote: se
+    reporta en `failed` para que el llamador pueda contarlo en vez de perderlo en silencio.
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    body = request.get_json() or {}
+    assets = body.get('assets') or []
+    if not isinstance(assets, list):
+        return jsonify({'ok': False, 'error': 'assets must be a list'}), 400
+    if len(assets) > 200:
+        return jsonify({'ok': False, 'error': 'too many assets (max 200)'}), 400
+    try:
+        models = _load_lgbm_models_cached()
+        if not models:
+            return jsonify({'ok': True, 'results': {}, 'failed': {}, 'models_loaded': 0})
         session_models = _load_lgbm_session_models_cached()
         ticker_models = _load_lgbm_ticker_models_cached()
         cluster_models = _load_lgbm_cluster_models_cached()
-        mso = float(indicators.get('minutes_since_open') or 0)
-        session = _get_market_session(mso)
-        cluster = TICKER_CLUSTERS.get(ticker, '') if ticker else ''
-        ticker_used = cluster_used = 0
-        predictions = {}
-        for key, (global_m, global_beta) in models.items():
-            # Priority: ticker (blended w/ cluster if data-starved) > cluster > session > global
-            horizon = key.split(':')[1]
-            t_key = f'{ticker}:{horizon}' if ticker else None
-            c_key = f'{cluster}:{horizon}' if cluster else None
-            blended = False
-            if t_key and t_key in ticker_models:
-                t_model, t_beta, t_n = ticker_models[t_key]
-                ticker_used += 1
-                if c_key and c_key in cluster_models and t_n < 200:
-                    # Continuous blend: weight ticker by its sample richness
-                    c_model, c_beta = cluster_models[c_key]
-                    w_t = t_n / 200.0
-                    pred_t = _lgbm_predict(t_model, X) * atr_scale + t_beta * spy_r15
-                    pred_c = _lgbm_predict(c_model, X) * atr_scale + c_beta * spy_r15
-                    predictions[key] = round(w_t * pred_t + (1.0 - w_t) * pred_c, 4)
-                    blended = True
-                else:
-                    m, beta = t_model, t_beta
-            elif c_key and c_key in cluster_models:
-                m, beta = cluster_models[c_key]
-                cluster_used += 1
-            else:
-                # New storage: '__session__:horizon:session'; old rows keyed by model_name
-                sess_key = f'__session__:{horizon}:{session}'
-                sess_entry = session_models.get(sess_key) or session_models.get(f'{key}:{session}')
-                if sess_entry:
-                    m, beta = sess_entry
-                else:
-                    m, beta = global_m, global_beta
-            if not blended:
-                pred_idio = _lgbm_predict(m, X) * atr_scale
-                predictions[key] = round(pred_idio + beta * spy_r15, 4)
+
+        results, failed = {}, {}
+        for a in assets:
+            ticker = (a or {}).get('ticker', '')
+            try:
+                results[ticker] = _predict_lgbm_one(
+                    (a or {}).get('indicators', {}), ticker, models,
+                    session_models, ticker_models, cluster_models)
+            except Exception as e:
+                failed[ticker] = str(e)[:200]
+
+        print(f'[predict_batch] {len(results)} ok, {len(failed)} fallidos, '
+              f'{len(models)} modelos', flush=True)
         return jsonify({
-            'ok': True, 'predictions': predictions,
+            'ok': True, 'results': results, 'failed': failed,
             'models_loaded': len(models),
-            'session': session,
-            'ticker_models_used': ticker_used,
-            'cluster_models_used': cluster_used,
-            'session_models_used': sum(1 for k in models if f'{k}:{session}' in session_models),
+            'assets_requested': len(assets),
         })
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
