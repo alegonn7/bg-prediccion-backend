@@ -139,8 +139,22 @@ LR_FEATURE_NAMES = [
 
 lr_training_jobs: dict = {}
 
-# Etapa 29.1 lo va a subir cuando la RPC esté paginada — hasta entonces el cap real es 1000.
-_INTRADAY_FETCH_LIMIT = 15000
+# Etapa 29.1 — con la RPC paginada, este límite ahora se cumple de verdad (antes el techo real
+# era 1000, el cap de PostgREST). _INTRADAY_PAGE_SIZE no puede superar 1000: es el cap del
+# transporte, pedir más no trae más, sólo lo esconde.
+#
+# Por qué 30.000 y no las ~72.000 filas elegibles que hay: Render corre en free tier (512 MB) y
+# ya tuvo un crash-loop por memoria (ver STATUS.md, 28/07). 30.000 filas ≈ 3 ruedas ≈ 10.000
+# eventos únicos, contra los 318 con los que entrenaba ridge:60 antes de este arreglo.
+#
+# Optimización pendiente, anotada acá porque es donde se nota: las filas vienen triplicadas. Para
+# un mismo (evento, horizonte) hay una fila por model_name (lgbm/ridge/reversion) con features
+# IDÉNTICAS. El modelo signed y LGBM entrenan contra actual_signed_pct, que es del evento y no del
+# modelo, así que 2 de cada 3 filas no aportan información a esos dos — sólo el clasificador de
+# dirección usa direction_correct, que sí es por modelo. Deduplicar del lado SQL triplicaría la
+# ventana efectiva sin costar memoria.
+_INTRADAY_FETCH_LIMIT = 30000
+_INTRADAY_PAGE_SIZE = 1000
 
 
 def _log_training_event(sb, event: str, summary: str, samples: int | None = None) -> None:
@@ -321,38 +335,65 @@ def _run_lr_training(job_id: str):
         sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
         job['status'] = 'fetching'
-        # get_intraday_training_data() is plpgsql (not inlinable) — PostgREST's .range()
-        # re-runs the whole function (join+sort+limit 15000) per page instead of pushing
-        # OFFSET/LIMIT into the query, so paginating in 1000-row chunks meant re-executing
-        # the expensive query up to 16x per job. Fixed by pushing p_limit into the function
-        # itself (same pattern as get_daily_training_data) and fetching in one call — with
-        # a couple of retries since a single call can still hit transient DB contention.
+        # Etapa 29.1 — Paginación por keyset. Historia de por qué es así y no de otra forma:
+        #
+        #   1. La versión original paginaba con .range() de PostgREST. get_intraday_training_data()
+        #      es plpgsql (no inlineable), así que PostgREST reejecutaba la función ENTERA por
+        #      página en vez de empujar OFFSET/LIMIT adentro: hasta 16 corridas del join+sort por
+        #      job, y con la tabla en +140k filas eso superaba el statement_timeout.
+        #   2. El arreglo fue pasar p_limit a la función y llamarla una sola vez. Eso resolvió el
+        #      timeout y creó un problema peor y silencioso: PostgREST cap-ea toda respuesta a
+        #      1000 filas pase lo que pida el cliente (el mismo tope que la Etapa 16 ya había
+        #      encontrado del lado del dashboard). Resultado real medido el 10/08: ridge:60 con
+        #      318 muestras, ridge:120 con 174, ridge:240 sin entrenar — y 31 features.
+        #   3. Un OFFSET adentro de la función tiene el mismo defecto de fondo que (1): la página
+        #      N reescanea las N-1 anteriores. Por eso keyset: cada página hace un seek por el
+        #      índice mpid_created y cuesta O(página).
+        #
+        # El desempate por id NO es cosmético: created_at no es único (las predicciones se insertan
+        # en lote y miles comparten timestamp), así que un cursor sólo por created_at saltearía y
+        # duplicaría filas en cada corte de página.
         all_rows = []
-        for attempt in range(3):
-            try:
-                resp = sb.rpc('get_intraday_training_data', {'p_limit': _INTRADAY_FETCH_LIMIT}).execute()
-                all_rows = resp.data or []
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise
-                print(f'[lr_train] fetch attempt {attempt + 1} failed: {e} — retrying', flush=True)
-                time.sleep(5 * (attempt + 1))
-        print(f'[lr_train] fetched {len(all_rows)} rows', flush=True)
+        before_ts, before_id = None, None
+        pages = 0
+        while len(all_rows) < _INTRADAY_FETCH_LIMIT:
+            page = None
+            for attempt in range(3):
+                try:
+                    resp = sb.rpc('get_intraday_training_data_page', {
+                        'p_limit': _INTRADAY_PAGE_SIZE,
+                        'p_before_created_at': before_ts,
+                        'p_before_id': before_id,
+                    }).execute()
+                    page = resp.data or []
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    print(f'[lr_train] page {pages} attempt {attempt + 1} failed: {e} — retrying', flush=True)
+                    time.sleep(5 * (attempt + 1))
 
-        # Etapa 27.6.3 — la RPC devolvía MENOS filas de las pedidas y nadie se enteraba.
-        # PostgREST cap-ea cada respuesta a 1000 filas pase lo que pase (mismo tope que la Etapa
-        # 16 encontró del lado del dashboard), así que este `p_limit: 15000` venía trayendo 1000
-        # exactas: 318 muestras para ridge:60, 174 para ridge:120 y 0 para 240min, con 31
-        # features. El arreglo de fondo (paginar) es la Etapa 29.1; esto sólo hace que deje de
-        # ser silencioso mientras tanto.
-        if len(all_rows) >= _INTRADAY_FETCH_LIMIT or len(all_rows) == 1000:
+            if not page:
+                break
+            all_rows.extend(page)
+            pages += 1
+            # cursor = última fila de la página (la función ordena created_at DESC, id DESC)
+            before_ts, before_id = page[-1]['created_at'], page[-1]['id']
+            if len(page) < _INTRADAY_PAGE_SIZE:
+                break   # se acabaron los datos, no el límite
+
+        print(f'[lr_train] fetched {len(all_rows)} rows in {pages} pages', flush=True)
+
+        # Etapa 27.6.3 — que un fetch corto no vuelva a pasar desapercibido. Con la paginación
+        # arreglada, quedarse exactamente en un múltiplo redondo del tamaño de página es la firma
+        # de un tope escondido, no de que se hayan acabado los datos.
+        if pages > 0 and len(all_rows) == pages * _INTRADAY_PAGE_SIZE and len(all_rows) < _INTRADAY_FETCH_LIMIT:
             _log_training_event(
                 sb, 'lr_train_intraday_truncated',
-                f'get_intraday_training_data devolvió {len(all_rows)} filas pidiendo '
-                f'{_INTRADAY_FETCH_LIMIT}. Si es exactamente 1000, es el cap de PostgREST y el '
-                f'entrenamiento intradiario está corriendo con una fracción de la muestra '
-                f'(ver Etapa 29.1).')
+                f'El fetch intradiario cortó en {len(all_rows)} filas ({pages} páginas completas) '
+                f'sin llegar al límite de {_INTRADAY_FETCH_LIMIT} y sin devolver una página '
+                f'parcial. Sospechar un tope nuevo del lado del transporte.',
+                samples=len(all_rows))
 
         job['total_samples'] = len(all_rows)
         if not all_rows:
@@ -363,7 +404,25 @@ def _run_lr_training(job_id: str):
         now_utc = datetime.now(timezone.utc)
         all_rows.sort(key=lambda r: _parse_ts(r.get('created_at')))
 
-        holdout_cutoff = now_utc - timedelta(days=30)
+        # Etapa 29.2 — El holdout de 30 días nunca existió, y el código no se enteraba.
+        #
+        # `limpieza-dominical-entrenamiento` (cron 51) borra model_predictions_intraday a los 7
+        # días, así que NUNCA hay filas de más de 30 días: holdout_mask daba todo True, tv_mask
+        # todo False, y el bloque de más abajo caía al fallback de "usar todo". O sea el
+        # entrenamiento intradiario venía entrenando y validando sobre el mismo período, sin
+        # holdout real — funcionando por accidente del fallback, no por diseño.
+        #
+        # Ahora el corte es proporcional cuando no hay 30 días de historia: se aparta el tramo más
+        # reciente (20% del período cubierto) como holdout. Con la ventana real de ~3 ruedas eso
+        # son las últimas horas: poco, pero es un holdout de verdad — y se agranda solo si sube la
+        # retención del cron 51.
+        _oldest = _parse_ts(all_rows[0].get('created_at'))
+        _span_days = max((now_utc - _oldest).total_seconds() / 86400, 0.0)
+        if _span_days >= 37.5:                       # historia de sobra: el corte fijo sirve
+            holdout_cutoff = now_utc - timedelta(days=30)
+        else:                                        # ventana corta: corte proporcional
+            holdout_cutoff = now_utc - timedelta(days=_span_days * 0.20)
+        print(f'[lr_train] ventana={_span_days:.1f}d holdout_desde={holdout_cutoff.isoformat()}', flush=True)
 
         def decay_w(ts_str):
             age = (now_utc - _parse_ts(ts_str)).total_seconds() / 86400
