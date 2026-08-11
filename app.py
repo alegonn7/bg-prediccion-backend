@@ -139,6 +139,32 @@ LR_FEATURE_NAMES = [
 
 lr_training_jobs: dict = {}
 
+# Etapa 29.1 lo va a subir cuando la RPC esté paginada — hasta entonces el cap real es 1000.
+_INTRADAY_FETCH_LIMIT = 15000
+
+
+def _log_training_event(sb, event: str, summary: str, samples: int | None = None) -> None:
+    """Etapa 27.6 — deja rastro en model_changelog de lo que antes fallaba en silencio.
+
+    Motivo (auditoría del 11/08/2026): el entrenamiento diario del 10/08 escribió
+    lgbm_cluster_models_daily a las 21:17 y NUNCA llegó a upsert_daily_signed_params, que es la
+    línea siguiente del mismo bucle. Los parámetros Ridge diarios quedaron congelados tres días y
+    no había forma de notarlo: el dashboard muestra 'última actualización', que con un fallo a
+    mitad de camino sigue mostrando una fecha vieja sin decir que hubo un intento fallido.
+
+    Nunca lanza: si el logging falla, el entrenamiento tiene que seguir igual.
+    """
+    try:
+        sb.table('model_changelog').insert({
+            'model_name': '__training__',
+            'change_type': 'lr_params',
+            'trigger': event,
+            'new_samples': samples,
+            'summary': summary[:2000],
+        }).execute()
+    except Exception as e:
+        print(f'[changelog] no se pudo registrar {event}: {e}', flush=True)
+
 TICKER_CLUSTERS: dict = {
     # high_beta: speculative/volatile growth — momentum-driven
     'NVDA': 'high_beta', 'TSLA': 'high_beta', 'AMD': 'high_beta',
@@ -304,7 +330,7 @@ def _run_lr_training(job_id: str):
         all_rows = []
         for attempt in range(3):
             try:
-                resp = sb.rpc('get_intraday_training_data', {'p_limit': 15000}).execute()
+                resp = sb.rpc('get_intraday_training_data', {'p_limit': _INTRADAY_FETCH_LIMIT}).execute()
                 all_rows = resp.data or []
                 break
             except Exception as e:
@@ -313,6 +339,20 @@ def _run_lr_training(job_id: str):
                 print(f'[lr_train] fetch attempt {attempt + 1} failed: {e} — retrying', flush=True)
                 time.sleep(5 * (attempt + 1))
         print(f'[lr_train] fetched {len(all_rows)} rows', flush=True)
+
+        # Etapa 27.6.3 — la RPC devolvía MENOS filas de las pedidas y nadie se enteraba.
+        # PostgREST cap-ea cada respuesta a 1000 filas pase lo que pase (mismo tope que la Etapa
+        # 16 encontró del lado del dashboard), así que este `p_limit: 15000` venía trayendo 1000
+        # exactas: 318 muestras para ridge:60, 174 para ridge:120 y 0 para 240min, con 31
+        # features. El arreglo de fondo (paginar) es la Etapa 29.1; esto sólo hace que deje de
+        # ser silencioso mientras tanto.
+        if len(all_rows) >= _INTRADAY_FETCH_LIMIT or len(all_rows) == 1000:
+            _log_training_event(
+                sb, 'lr_train_intraday_truncated',
+                f'get_intraday_training_data devolvió {len(all_rows)} filas pidiendo '
+                f'{_INTRADAY_FETCH_LIMIT}. Si es exactamente 1000, es el cap de PostgREST y el '
+                f'entrenamiento intradiario está corriendo con una fracción de la muestra '
+                f'(ver Etapa 29.1).')
 
         job['total_samples'] = len(all_rows)
         if not all_rows:
@@ -2029,11 +2069,30 @@ def _run_lr_training_daily(job_id: str):
         job['status'] = 'done'
         job['models_trained'] = len(upserts)
         print(f'[lr_train_daily] done: {len(upserts)} buckets trained', flush=True)
+        # Etapa 27.6.1 — registrar el ÉXITO explícitamente. Sin esto no hay forma de distinguir
+        # "no corrió" de "corrió y se cortó a la mitad", que es exactamente lo que pasó el 10/08.
+        _log_training_event(
+            sb, 'lr_train_daily_ok',
+            f'Entrenamiento diario completo: {len(upserts)} buckets con parámetros escritos en '
+            f'model_signed_params_daily.',
+            samples=job.get('total_samples'))
 
     except Exception as e:
         job['status'] = 'error'
         job['error'] = str(e)
         print(f'[lr_train_daily] ERROR: {e}', flush=True)
+        # Etapa 27.6.1 — y registrar el FALLO. El caso del 10/08 murió entre
+        # upsert_daily_cluster_model y upsert_daily_signed_params (líneas consecutivas), así que
+        # la mitad de los modelos quedó fresca y la otra mitad de tres días atrás, sin aviso.
+        try:
+            _log_training_event(
+                sb, 'lr_train_daily_error',
+                f'Entrenamiento diario ABORTADO: {e}. Los parámetros de model_signed_params_daily '
+                f'pueden haber quedado desactualizados respecto de lgbm_cluster_models_daily — '
+                f'comparar last_updated de ambas antes de confiar en las predicciones.',
+                samples=job.get('total_samples'))
+        except Exception:
+            pass
 
     finally:
         _ka_stop.set()
