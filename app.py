@@ -991,6 +991,7 @@ def _run_lr_training(job_id: str):
             cluster_data[ck]['ts'].append(row.get('created_at'))
 
         cluster_upserts = []
+        ridge_cluster_upserts = []  # Etapa 29.6.3
         cluster_lgbm_cache: dict = {}
         for (cluster_name, horizon_minutes), cdata in cluster_data.items():
             n = len(cdata['X'])
@@ -1067,11 +1068,51 @@ def _run_lr_training(job_id: str):
             })
             print(f'[lr_train:cluster] {cluster_name}:{horizon_minutes} n={tm.sum()} val_mae={c_val_mae} beta={c_beta:.3f}', flush=True)
 
+            # Etapa 29.6.3 — Ridge propio por cluster, empezando por arg_ars. Reusa Xs_c/ys_c/sc_c
+            # ya calculados arriba para el LGBM de este mismo cluster (mismo holdout, mismo beta,
+            # mismo escalado) — nada se recalcula. A diferencia de LGBM (ys_cn, normalizado por
+            # ATR), Ridge usa ys_c sin normalizar, igual que el Ridge global unas líneas más arriba
+            # en esta misma función (ver 'Ridge signed — kept for backward compat').
+            #
+            # Por qué hace falta: hasta ahora sólo LGBM se entrenaba por cluster (Etapa "Hallazgo
+            # grande", 08/08) — Ridge seguía siendo un único modelo global, entrenado casi todo con
+            # datos de EEUU. arg_ars mide 1.484-1.992 muestras/horizonte (verificado el 14/08,
+            # sobre el mínimo de 50), así que no nace con coeficientes en cero como sí habría
+            # pasado si se hubiera intentado esto antes de que el universo argentino acumulara
+            # historia — mismo mecanismo que dejó en 0 la feature híbrida del lado diario.
+            reg_ridge_c = Ridge(alpha=1.0)
+            reg_ridge_c.fit(Xs_c, ys_c, sample_weight=ws_c)
+            ridge_c_val_mae = None
+            if vm_c.sum() > 0:
+                ridge_c_val_mae = float(np.mean(np.abs(y_v[vm_c] - reg_ridge_c.predict(X_v_c[vm_c]))))
+            mag_valid_c = np.abs(y_tv[~np.isnan(y_tv)])
+            ridge_cluster_upserts.append({
+                'cluster_name': cluster_name,
+                'horizon_minutes': horizon_minutes,
+                'feature_names': LR_FEATURE_NAMES,
+                'signed_coefficients': reg_ridge_c.coef_.tolist(),
+                'signed_bias': float(reg_ridge_c.intercept_),
+                'feature_means': sc_c.mean_.tolist(),
+                'feature_stds': sc_c.scale_.tolist(),
+                'avg_actual_mag': float(np.mean(mag_valid_c)) if len(mag_valid_c) > 0 else None,
+                'median_actual_mag': float(np.median(mag_valid_c)) if len(mag_valid_c) > 0 else None,
+                'val_mae_ridge': ridge_c_val_mae,
+                'train_samples': int(tm.sum()),
+                'last_updated': now_utc.isoformat(),
+            })
+            print(f'[lr_train:ridge_cluster] {cluster_name}:{horizon_minutes} n={tm.sum()} val_mae={ridge_c_val_mae}', flush=True)
+
         for cu in cluster_upserts:
             sb.table('lgbm_cluster_models_intraday').upsert(
                 cu, on_conflict='cluster_name,horizon_minutes'
             ).execute()
         print(f'[lr_train] cluster models: {len(cluster_upserts)} trained', flush=True)
+
+        for rcu in ridge_cluster_upserts:
+            sb.table('ridge_cluster_models_intraday').upsert(
+                rcu, on_conflict='cluster_name,horizon_minutes'
+            ).execute()
+        print(f'[lr_train] ridge cluster models: {len(ridge_cluster_upserts)} trained', flush=True)
         # ─────────────────────────────────────────────────────────────────────
 
         job['status'] = 'done'
