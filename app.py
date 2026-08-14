@@ -2264,42 +2264,81 @@ def _load_lgbm_models_cached():
     return _lgbm_cache
 
 
-def _load_lgbm_session_models_cached():
-    """Load per-session LGBM models. Keys: 'model_name:horizon:session'. Values: (model, beta_spy)."""
+# Etapa 29.3-fix (14/08/2026) — INCIDENTE DE PRODUCCIÓN, no cosmético.
+#
+# Las tres funciones de abajo cargaban SIEMPRE la tabla entera y deserializaban cada fila con
+# pickle.loads()/LightGBM nativo, sin filtrar por lo que la request realmente necesitaba. Mientras
+# lgbm_ticker_models_intraday tuvo pocas filas (0 en el audit del 11/08) esto no se notaba. La
+# Etapa 29.1 (paginación real del entrenamiento) hizo que esa tabla pasara a 181 filas de la noche
+# a la mañana — y una carga en frío de ~210 modelos (181 ticker + 18 cluster + 11 session, éstos
+# últimos ~263 KB promedio, más pesados de deserializar que los de ticker) empezó a superar el
+# tiempo que el worker de gunicorn tolera sin heartbeat. Confirmado en logs reales de Render:
+#   [CRITICAL] WORKER TIMEOUT (pid:65) ... pickle.loads(...) -> LGBM_BoosterLoadModelFromString
+#   Worker (pid:65) was sent SIGKILL!
+# Y como el worker muere A MITAD de poblar el caché, el caché NUNCA llega a calentarse: cada
+# worker nuevo repite la carga completa desde cero y vuelve a morir — un bucle que no se autocura.
+#
+# El arreglo: cachear de forma INCREMENTAL, filtrando por lo que la request pide. Cada llamada
+# sólo trae y deserializa lo que todavía no tiene cacheado, y lo suma a lo ya cacheado (no lo
+# reemplaza) — así el costo real queda acotado al universo REALMENTE consultado en la práctica
+# (~78 activos intradiarios activos, llamados una y otra vez desde el mismo cron cada 15 min),
+# no a los ~181-210 que acumula el histórico de 90 días con tickers que ya ni están activos.
+# `filter_values=None` preserva el comportamiento viejo (traer todo) para quien lo necesite a
+# propósito — hoy nadie lo usa así.
+
+def _load_lgbm_session_models_cached(sessions: set | None = None):
+    """Per-session LGBM models. Keys: 'model_name:horizon:session'. Values: (model, beta_spy)."""
     global _lgbm_session_cache, _lgbm_session_cache_ts
-    if time.time() - _lgbm_session_cache_ts < 600 and _lgbm_session_cache:
-        return _lgbm_session_cache
+    if time.time() - _lgbm_session_cache_ts > 600:
+        _lgbm_session_cache = {}
+    if sessions is not None:
+        have = {k.split(':')[2] for k in _lgbm_session_cache}
+        missing = sorted(set(sessions) - have)
+        if not missing:
+            return _lgbm_session_cache
+    else:
+        missing = None
     from supabase import create_client
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-    resp = sb.table('lgbm_session_models_intraday').select(
+    q = sb.table('lgbm_session_models_intraday').select(
         'model_name,horizon_minutes,market_session,lgbm_model,beta_spy'
-    ).execute()
-    new_cache: dict = {}
+    )
+    if missing is not None:
+        q = q.in_('market_session', missing)
+    resp = q.execute()
     for row in resp.data or []:
         if row.get('lgbm_model'):
             key = f"{row['model_name']}:{row['horizon_minutes']}:{row['market_session']}"
             try:
                 model = pickle.loads(base64.b64decode(row['lgbm_model']))
                 beta = float(row.get('beta_spy') or 0.0)
-                new_cache[key] = (model, beta)
+                _lgbm_session_cache[key] = (model, beta)
             except Exception:
                 pass
-    _lgbm_session_cache = new_cache
     _lgbm_session_cache_ts = time.time()
     return _lgbm_session_cache
 
 
-def _load_lgbm_ticker_models_cached():
+def _load_lgbm_ticker_models_cached(tickers: set | None = None):
     """Per-ticker LGBM models. Keys: 'TICKER:horizon'. Values: (model, beta_spy, train_samples)."""
     global _lgbm_ticker_cache, _lgbm_ticker_cache_ts
-    if time.time() - _lgbm_ticker_cache_ts < 600 and _lgbm_ticker_cache:
-        return _lgbm_ticker_cache
+    if time.time() - _lgbm_ticker_cache_ts > 600:
+        _lgbm_ticker_cache = {}
+    if tickers is not None:
+        have = {k.split(':')[0] for k in _lgbm_ticker_cache}
+        missing = sorted(set(tickers) - have)
+        if not missing:
+            return _lgbm_ticker_cache
+    else:
+        missing = None
     from supabase import create_client
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-    resp = sb.table('lgbm_ticker_models_intraday').select(
+    q = sb.table('lgbm_ticker_models_intraday').select(
         'ticker,horizon_minutes,lgbm_model,beta_spy,train_samples'
-    ).execute()
-    new_cache: dict = {}
+    )
+    if missing is not None:
+        q = q.in_('ticker', missing)
+    resp = q.execute()
     for row in resp.data or []:
         if row.get('lgbm_model'):
             key = f"{row['ticker']}:{row['horizon_minutes']}"
@@ -2307,35 +2346,42 @@ def _load_lgbm_ticker_models_cached():
                 model = pickle.loads(base64.b64decode(row['lgbm_model']))
                 beta = float(row.get('beta_spy') or 0.0)
                 n_samples = int(row.get('train_samples') or 0)
-                new_cache[key] = (model, beta, n_samples)
+                _lgbm_ticker_cache[key] = (model, beta, n_samples)
             except Exception:
                 pass
-    _lgbm_ticker_cache = new_cache
     _lgbm_ticker_cache_ts = time.time()
     return _lgbm_ticker_cache
 
 
-def _load_lgbm_cluster_models_cached():
+def _load_lgbm_cluster_models_cached(clusters: set | None = None):
     """Per-cluster LGBM models. Keys: 'cluster_name:horizon'. Values: (model, beta_spy)."""
     global _lgbm_cluster_cache, _lgbm_cluster_cache_ts
-    if time.time() - _lgbm_cluster_cache_ts < 600 and _lgbm_cluster_cache:
-        return _lgbm_cluster_cache
+    if time.time() - _lgbm_cluster_cache_ts > 600:
+        _lgbm_cluster_cache = {}
+    if clusters is not None:
+        have = {k.split(':')[0] for k in _lgbm_cluster_cache}
+        missing = sorted(set(clusters) - have)
+        if not missing:
+            return _lgbm_cluster_cache
+    else:
+        missing = None
     from supabase import create_client
     sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-    resp = sb.table('lgbm_cluster_models_intraday').select(
+    q = sb.table('lgbm_cluster_models_intraday').select(
         'cluster_name,horizon_minutes,lgbm_model,beta_spy'
-    ).execute()
-    new_cache: dict = {}
+    )
+    if missing is not None:
+        q = q.in_('cluster_name', missing)
+    resp = q.execute()
     for row in resp.data or []:
         if row.get('lgbm_model'):
             key = f"{row['cluster_name']}:{row['horizon_minutes']}"
             try:
                 model = pickle.loads(base64.b64decode(row['lgbm_model']))
                 beta = float(row.get('beta_spy') or 0.0)
-                new_cache[key] = (model, beta)
+                _lgbm_cluster_cache[key] = (model, beta)
             except Exception:
                 pass
-    _lgbm_cluster_cache = new_cache
     _lgbm_cluster_cache_ts = time.time()
     return _lgbm_cluster_cache
 
@@ -2592,14 +2638,21 @@ def predict_lgbm_all():
     if not _check_secret():
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
     body = request.get_json() or {}
+    ticker = body.get('ticker', '')
+    indicators = body.get('indicators', {}) or {}
     try:
         models = _load_lgbm_models_cached()
         if not models:
             return jsonify({'ok': True, 'predictions': {}, 'models_loaded': 0})
+        # Etapa 29.3-fix: filtrar por lo que ESTA request necesita, no traer las tablas enteras.
+        mso = float(indicators.get('minutes_since_open') or 0)
+        session = _get_market_session(mso)
+        cluster = TICKER_CLUSTERS.get(ticker, '') if ticker else ''
         out = _predict_lgbm_one(
-            body.get('indicators', {}), body.get('ticker', ''), models,
-            _load_lgbm_session_models_cached(), _load_lgbm_ticker_models_cached(),
-            _load_lgbm_cluster_models_cached())
+            indicators, ticker, models,
+            _load_lgbm_session_models_cached({session}),
+            _load_lgbm_ticker_models_cached({ticker} if ticker else set()),
+            _load_lgbm_cluster_models_cached({cluster} if cluster else set()))
         return jsonify({'ok': True, 'models_loaded': len(models), **out})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -2636,9 +2689,24 @@ def predict_lgbm_batch():
         models = _load_lgbm_models_cached()
         if not models:
             return jsonify({'ok': True, 'results': {}, 'failed': {}, 'models_loaded': 0})
-        session_models = _load_lgbm_session_models_cached()
-        ticker_models = _load_lgbm_ticker_models_cached()
-        cluster_models = _load_lgbm_cluster_models_cached()
+
+        # Etapa 29.3-fix: precalcular la UNIÓN de tickers/sesiones/clusters que este lote
+        # necesita, y pedir sólo eso — ver el comentario largo sobre el incidente de producción
+        # arriba de _load_lgbm_ticker_models_cached(). Es aritmética pura, sin red ni DB, así
+        # que hacerlo antes de cargar no cuesta nada.
+        needed_tickers = {(a or {}).get('ticker', '') for a in assets if (a or {}).get('ticker')}
+        needed_sessions, needed_clusters = set(), set()
+        for a in assets:
+            ind = (a or {}).get('indicators', {}) or {}
+            needed_sessions.add(_get_market_session(float(ind.get('minutes_since_open') or 0)))
+            t = (a or {}).get('ticker', '')
+            c = TICKER_CLUSTERS.get(t, '') if t else ''
+            if c:
+                needed_clusters.add(c)
+
+        session_models = _load_lgbm_session_models_cached(needed_sessions)
+        ticker_models = _load_lgbm_ticker_models_cached(needed_tickers)
+        cluster_models = _load_lgbm_cluster_models_cached(needed_clusters)
 
         results, failed = {}, {}
         for a in assets:
@@ -2651,7 +2719,8 @@ def predict_lgbm_batch():
                 failed[ticker] = str(e)[:200]
 
         print(f'[predict_batch] {len(results)} ok, {len(failed)} fallidos, '
-              f'{len(models)} modelos', flush=True)
+              f'{len(models)} modelos globales, filtrado a {len(needed_tickers)} tickers/'
+              f'{len(needed_sessions)} sesiones/{len(needed_clusters)} clusters', flush=True)
         return jsonify({
             'ok': True, 'results': results, 'failed': failed,
             'models_loaded': len(models),
