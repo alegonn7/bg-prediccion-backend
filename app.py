@@ -2962,10 +2962,16 @@ def _run_motor_entradas(sb, source):
     if not portfolios:
         return {'ok': True, 'skipped': 'no_portfolios', 'opened': 0}
 
+    # Etapa 30 (continuación, egress — el usuario ya se pasó del límite de Supabase antes, cuidado):
+    # sin acotar, esto trae TODA la historia de auto_trades, creciendo sin límite con cada semana
+    # que pasa. Sólo hace falta lo abierto (para slots/reparto de capital) y lo cerrado HOY (para el
+    # límite de pérdida diaria) — 3 días de margen cubre de sobra cualquier trade todavía abierto
+    # (ningún horizonte de este motor pasa el día) sin traer meses de historial de vuelta.
+    since_cutoff = (datetime.utcnow() - timedelta(days=3)).isoformat()
     all_trades = sb.from_('auto_trades').select(
         'id, portfolio_id, status, closed_at, pnl_monto, daily_prediction_id, intraday_prediction_id, '
         'modo, prediction_type, monto_invertido, venue'
-    ).execute().data or []
+    ).gte('opened_at', since_cutoff).execute().data or []
     open_trades = [t for t in all_trades if t['status'] == 'abierta']
     already_traded_pred_ids = (
         {t['daily_prediction_id'] for t in all_trades if t.get('daily_prediction_id')} |
@@ -3013,9 +3019,10 @@ def _run_motor_entradas(sb, source):
         if pnl_today <= loss_limit:
             blocked_portfolio_ids.add(pf['id'])
 
+    scorecard_horizon_unit = 'minutes' if source == 'intraday' else 'days'
     scorecard = sb.from_('scorecard_bolsas').select(
         'asset_id, currency, horizon_unit, horizon_bucket, estado, expectancy_net_pct'
-    ).execute().data or []
+    ).eq('horizon_unit', scorecard_horizon_unit).execute().data or []
     scorecard_by_key = {(s['asset_id'], s['currency'], s['horizon_unit'], s['horizon_bucket']): s for s in scorecard}
 
     assets_by_id = {a['id']: a for a in (
@@ -3147,19 +3154,29 @@ def _get_latest_prices(sb, asset_ids):
     """Último precio conocido por activo: `indicators_intraday.price_close` (más fresco, cada
     ~10 min en horario de mercado) con fallback a `price_history.close` (cierre diario) para
     activos sin fila intradiaria reciente — cubre tanto auto_trades intradiarios como diarios."""
+    # Etapa 30 (continuación, a pedido explícito del usuario — cuidado con el egress de Supabase,
+    # ya se pasaron de eso antes): ambas consultas de acá abajo NO tenían límite ni ventana de
+    # tiempo — `indicators_intraday` guarda 14 días de historial (~una fila cada 10 min por activo)
+    # y `price_history` años. Sin acotar, cada corrida traía TODO ese historial de vuelta sólo para
+    # quedarse con la fila más reciente. Ahora se acota a una ventana chica (2h intradía, 5 días
+    # diario) + un límite duro — de sobra para encontrar el último precio, sin traer de más.
     asset_ids = list(asset_ids)
     if not asset_ids:
         return {}
     prices = {}
+    recent_cutoff = (datetime.utcnow() - timedelta(hours=2)).isoformat()
     ii = sb.from_('indicators_intraday').select('asset_id, price_close, calculated_at') \
-        .in_('asset_id', asset_ids).order('calculated_at', desc=True).execute().data or []
+        .in_('asset_id', asset_ids).gte('calculated_at', recent_cutoff) \
+        .order('calculated_at', desc=True).limit(len(asset_ids) * 6).execute().data or []
     for row in ii:
         if row['asset_id'] not in prices and row.get('price_close') is not None:
             prices[row['asset_id']] = float(row['price_close'])
     missing = [a for a in asset_ids if a not in prices]
     if missing:
+        recent_days_cutoff = (datetime.utcnow() - timedelta(days=5)).date().isoformat()
         ph = sb.from_('price_history').select('asset_id, close, trade_date') \
-            .in_('asset_id', missing).order('trade_date', desc=True).execute().data or []
+            .in_('asset_id', missing).gte('trade_date', recent_days_cutoff) \
+            .order('trade_date', desc=True).limit(len(missing) * 5).execute().data or []
         for row in ph:
             if row['asset_id'] not in prices and row.get('close') is not None:
                 prices[row['asset_id']] = float(row['close'])
