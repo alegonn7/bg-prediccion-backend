@@ -2980,10 +2980,25 @@ def _run_motor_entradas(sb, source):
     for t in all_trades:
         if t.get('closed_at') and str(t['closed_at'])[:10] == today and t.get('pnl_monto') is not None:
             daily_pnl_by_portfolio[t['portfolio_id']] += float(t['pnl_monto'])
+
+    # Etapa 30 (continuación): el límite de pérdida diaria tiene que medirse contra plata REAL para
+    # las monedas en vivo, no contra auto_portfolios.capital_inicial (placeholder de papel,
+    # $1.000.000 — 100x más grande que el capital real de ~$10.000, lo que hacía que el freno nunca
+    # se fuera a disparar de verdad). capital_base reconstruye "cuánto había al empezar hoy" como
+    # efectivo actual menos lo ya ganado/perdido hoy — no incluye el valor de posiciones abiertas
+    # todavía sin cerrar, así que subestima el capital total mientras algo está invertido, lo cual
+    # empuja el freno a activarse ANTES de lo estrictamente necesario — más conservador, no al revés.
+    real_ars_cash = _iol_available_ars_cash() if cfg.get('live_enabled_byma', False) else None
+
     blocked_portfolio_ids = set()
     for pf in portfolios.values():
-        loss_limit = -abs(float(cfg.get('max_daily_loss_pct', 3))) / 100.0 * float(pf['capital_inicial'])
-        if daily_pnl_by_portfolio.get(pf['id'], 0.0) <= loss_limit:
+        pnl_today = daily_pnl_by_portfolio.get(pf['id'], 0.0)
+        if pf['currency'] == 'ars' and real_ars_cash is not None:
+            capital_base = real_ars_cash - pnl_today
+        else:
+            capital_base = float(pf['capital_inicial'])
+        loss_limit = -abs(float(cfg.get('max_daily_loss_pct', 3))) / 100.0 * capital_base
+        if pnl_today <= loss_limit:
             blocked_portfolio_ids.add(pf['id'])
 
     scorecard = sb.from_('scorecard_bolsas').select(
