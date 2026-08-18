@@ -2963,7 +2963,8 @@ def _run_motor_entradas(sb, source):
         return {'ok': True, 'skipped': 'no_portfolios', 'opened': 0}
 
     all_trades = sb.from_('auto_trades').select(
-        'id, portfolio_id, status, closed_at, pnl_monto, daily_prediction_id, intraday_prediction_id'
+        'id, portfolio_id, status, closed_at, pnl_monto, daily_prediction_id, intraday_prediction_id, '
+        'modo, prediction_type, monto_invertido, venue'
     ).execute().data or []
     open_trades = [t for t in all_trades if t['status'] == 'abierta']
     already_traded_pred_ids = (
@@ -2974,6 +2975,17 @@ def _run_motor_entradas(sb, source):
     slots_left = int(cfg.get('max_concurrent_positions', 10)) - len(open_trades)
     if slots_left <= 0:
         return {'ok': True, 'skipped': 'max_concurrent_positions', 'opened': 0}
+
+    # Etapa 30 (continuación): reparto explícito de capital real entre intradiario y diario h=1
+    # (pedido del usuario: $8.000/$2.000) — cuánto de la asignación de ESTE `source` ya está
+    # comprometido en posiciones vivo abiertas, para no pasarse del tope al dimensionar una entrada
+    # nueva más abajo.
+    live_committed_this_source = sum(
+        float(t['monto_invertido']) for t in open_trades
+        if t.get('modo') == 'vivo' and t.get('venue') == 'BYMA' and t.get('prediction_type') == source
+    )
+    live_capital_cap = float(cfg.get(
+        'live_capital_intraday_ars' if source == 'intraday' else 'live_capital_daily_ars', 0))
 
     today = datetime.utcnow().date().isoformat()
     daily_pnl_by_portfolio = defaultdict(float)
@@ -3085,7 +3097,11 @@ def _run_motor_entradas(sb, source):
             if cash is None or cash <= 0:
                 skipped_reasons['vivo_sin_efectivo'] += 1
                 continue
-            monto_invertido = cash * float(cfg.get('live_position_pct', 90)) / 100.0
+            # Reparto explícito por source (Etapa 30 continuación) — nunca comprometer más del tope
+            # asignado a intradiario/diario, aunque sobre efectivo real de la otra asignación.
+            remaining_allocation = max(0.0, live_capital_cap - live_committed_this_source)
+            budget = min(remaining_allocation, cash)
+            monto_invertido = budget * float(cfg.get('live_position_pct', 90)) / 100.0
             cantidad = int(monto_invertido / entry_price)  # unidades enteras — IOL no fracciona acciones/CEDEARs
             if cantidad < 1:
                 skipped_reasons['vivo_monto_insuficiente'] += 1
@@ -3096,6 +3112,7 @@ def _run_motor_entradas(sb, source):
                 iol_buy_order_id = orden.get('numeroOperacion') or orden.get('numero') or orden.get('id')
                 modo = 'vivo'
                 monto_invertido = cantidad * entry_price
+                live_committed_this_source += monto_invertido
                 print(f'[motor_ejecucion] VIVO: compra real {asset["ticker"]} x{cantidad} '
                       f'@ {entry_price} — orden {iol_buy_order_id}', flush=True)
             except Exception as e:
