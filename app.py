@@ -3251,6 +3251,22 @@ def motor_ejecucion():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
+@app.route('/api/iol_test', methods=['GET'])
+def iol_test():
+    """Diagnóstico: confirma que IOL_USERNAME/IOL_PASSWORD autentican de verdad contra la API real
+    de IOL, y expone la respuesta cruda de estadocuenta para poder ajustar
+    _iol_available_ars_cash() si su parseo defensivo no matchea el shape real (nunca se probó
+    contra una cuenta real hasta tener credenciales) — no hace ninguna operación, sólo lee."""
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    try:
+        raw = _iol_estado_cuenta()
+        parsed_ars_cash = _iol_available_ars_cash()
+        return jsonify({'ok': True, 'auth': 'ok', 'estado_cuenta_raw': raw, 'parsed_ars_cash': parsed_ars_cash})
+    except Exception as e:
+        return jsonify({'ok': False, 'auth': 'failed', 'error': str(e)}), 500
+
+
 # ── APScheduler: auto-train daily at 21:30 UTC ────────────────────────────────
 
 def _keep_alive_loop(stop_event: threading.Event):
