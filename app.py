@@ -2256,6 +2256,15 @@ _lgbm_ticker_cache_ts: float = 0.0
 _lgbm_cluster_cache: dict = {}
 _lgbm_cluster_cache_ts: float = 0.0
 
+# Etapa 29.3-fix2 (18/08/2026) — ver comentario largo más abajo. TTL tiene que superar el
+# intervalo del cron (15 min) con margen, si no el progreso incremental nunca sobrevive de una
+# corrida a la siguiente.
+_LGBM_CACHE_TTL = 1800
+# Tope de cuántos tickers NUEVOS se deserializan por request — acota el costo de una sola
+# llamada para que no vuelva a matar el worker, sin bloquear la predicción (ver fallback
+# ticker > cluster > sesión > global en _predict_lgbm_one, siempre devuelve algo).
+_LGBM_MAX_NEW_TICKERS_PER_CALL = 15
+
 
 def _enrich_indicators(ind: dict) -> dict:
     """Compute numeric versions of categorical/boolean indicator fields for inference."""
@@ -2326,11 +2335,39 @@ def _load_lgbm_models_cached():
 # no a los ~181-210 que acumula el histórico de 90 días con tickers que ya ni están activos.
 # `filter_values=None` preserva el comportamiento viejo (traer todo) para quien lo necesite a
 # propósito — hoy nadie lo usa así.
+#
+# Etapa 29.3-fix2 (18/08/2026) — el fix de arriba no alcanzaba, confirmado con logs reales de
+# Render en mercado abierto: `[CRITICAL] WORKER TIMEOUT` dentro de este mismo
+# `pickle.loads`/`LGBM_BoosterLoadModelFromString`, en TODAS las corridas del día (0/78 lgbm en
+# `model_changelog` cada 15 min desde el 11/08, no sólo en frío). Dos motivos, los dos vigentes
+# a la vez:
+#   1. El TTL (600s) es MENOR al intervalo del cron (`intraday-prediccion-15min`, cada 900s) —
+#      el caché siempre estaba vencido antes de la próxima corrida, así que "incremental" nunca
+#      tenía nada previo sobre lo cual incrementar: cada llamada volvía a pedir los ~78 tickers
+#      enteros de cero.
+#   2. Ese cold-load de ~78 tickers (hasta 234 filas con los 3 horizontes) por sí solo ya tarda
+#      más de lo que el worker tolera en producción — el `--timeout 600` del Procfile no explica
+#      por qué muere en segundos, no en 10 minutos; probablemente el Start Command real en el
+#      dashboard de Render no sea el del Procfile (no verificable desde acá, sin acceso a esa
+#      cuenta — si una sesión futura tiene ese acceso, vale la pena confirmarlo y de paso
+#      simplificar este workaround).
+# Con el worker muriendo a mitad de carga, el caché nunca terminaba de poblarse — un bucle que
+# no se autocuraba, igual que el incidente original que motivó el fix de arriba.
+#
+# Mitigación (sin depender de arreglar Render): `_LGBM_MAX_NEW_TICKERS_PER_CALL` acota cuántos
+# tickers NUEVOS se deserializan por request, y `_LGBM_CACHE_TTL` (30 min) supera el intervalo
+# del cron con margen. El progreso ahora sí sobrevive de una corrida a la siguiente — el universo
+# de 78 activos se termina de cachear en ~5-6 corridas (~75-90 min) en vez de una sola que nunca
+# llegaba a completarse. Mientras un ticker todavía no tiene su modelo propio cacheado,
+# `_predict_lgbm_one` ya cae solo al fallback cluster/sesión/global (ver esa función) — la
+# predicción sale igual, sólo menos personalizada hasta que le toque su turno. Verificar con
+# `select model_name, count(*) from model_predictions_intraday where created_at > now() -
+# interval '1 day' group by 1` que `lgbm` deja de estar en 0.
 
 def _load_lgbm_session_models_cached(sessions: set | None = None):
     """Per-session LGBM models. Keys: 'model_name:horizon:session'. Values: (model, beta_spy)."""
     global _lgbm_session_cache, _lgbm_session_cache_ts
-    if time.time() - _lgbm_session_cache_ts > 600:
+    if time.time() - _lgbm_session_cache_ts > _LGBM_CACHE_TTL:
         _lgbm_session_cache = {}
     if sessions is not None:
         have = {k.split(':')[2] for k in _lgbm_session_cache}
@@ -2363,13 +2400,18 @@ def _load_lgbm_session_models_cached(sessions: set | None = None):
 def _load_lgbm_ticker_models_cached(tickers: set | None = None):
     """Per-ticker LGBM models. Keys: 'TICKER:horizon'. Values: (model, beta_spy, train_samples)."""
     global _lgbm_ticker_cache, _lgbm_ticker_cache_ts
-    if time.time() - _lgbm_ticker_cache_ts > 600:
+    if time.time() - _lgbm_ticker_cache_ts > _LGBM_CACHE_TTL:
         _lgbm_ticker_cache = {}
     if tickers is not None:
         have = {k.split(':')[0] for k in _lgbm_ticker_cache}
         missing = sorted(set(tickers) - have)
         if not missing:
             return _lgbm_ticker_cache
+        # Etapa 29.3-fix2: acota el trabajo de ESTA request — ver comentario largo arriba de
+        # _load_lgbm_session_models_cached. Los tickers que quedan afuera este turno siguen
+        # recibiendo predicción vía el fallback de _predict_lgbm_one, sólo que menos
+        # personalizada hasta que les toque cachearse.
+        missing = missing[:_LGBM_MAX_NEW_TICKERS_PER_CALL]
     else:
         missing = None
     from supabase import create_client
@@ -2391,13 +2433,17 @@ def _load_lgbm_ticker_models_cached(tickers: set | None = None):
             except Exception:
                 pass
     _lgbm_ticker_cache_ts = time.time()
+    if missing is not None:
+        cached_tickers = {k.split(':')[0] for k in _lgbm_ticker_cache}
+        print(f'[lgbm_ticker_cache] +{len(missing)} tickers this call, '
+              f'{len(cached_tickers)} cached total', flush=True)
     return _lgbm_ticker_cache
 
 
 def _load_lgbm_cluster_models_cached(clusters: set | None = None):
     """Per-cluster LGBM models. Keys: 'cluster_name:horizon'. Values: (model, beta_spy)."""
     global _lgbm_cluster_cache, _lgbm_cluster_cache_ts
-    if time.time() - _lgbm_cluster_cache_ts > 600:
+    if time.time() - _lgbm_cluster_cache_ts > _LGBM_CACHE_TTL:
         _lgbm_cluster_cache = {}
     if clusters is not None:
         have = {k.split(':')[0] for k in _lgbm_cluster_cache}
