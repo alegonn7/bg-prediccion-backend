@@ -3186,8 +3186,12 @@ def _run_motor_salidas(sb):
     daily_status = {p['id']: p for p in (
         sb.from_('consensus_predictions').select('id, status, actual_final_price')
         .in_('id', daily_pred_ids).execute().data or [])} if daily_pred_ids else {}
+    # Etapa 30 (continuación, a pedido explícito del usuario): NO esperar a que `juez-intraday`
+    # (que corre cada 5 min, en su propio cron, fuera de esta etapa) marque `status='closed'` — acá
+    # se compara `target_time` directo contra la hora actual, así el cierre por vencimiento no
+    # arrastra el retraso de ese otro job encima del propio de este motor.
     intraday_status = {p['id']: p for p in (
-        sb.from_('consensus_predictions_intraday').select('id, status, actual_price')
+        sb.from_('consensus_predictions_intraday').select('id, status, actual_price, target_time')
         .in_('id', intraday_pred_ids).execute().data or [])} if intraday_pred_ids else {}
 
     latest_prices = _get_latest_prices(sb, {t['asset_id'] for t in open_trades})
@@ -3203,11 +3207,21 @@ def _run_motor_salidas(sb):
             exit_price, close_status = current_price, 'cerrada_por_take_profit'
         elif gross_pct_now is not None and gross_pct_now <= t['stop_loss_usado_pct']:
             exit_price, close_status = current_price, 'cerrada_por_stop'
+        elif t['prediction_type'] == 'intraday':
+            # Etapa 30 (continuación): vencimiento contra `target_time` directo (exacto, no
+            # depende del cron de juez-intraday) — pedido explícito del usuario de que el cierre
+            # coincida con el momento real del horizonte, no con el de otro job.
+            pred = intraday_status.get(t['intraday_prediction_id'])
+            target_time_raw = pred.get('target_time') if pred else None
+            if target_time_raw:
+                target_time = datetime.fromisoformat(target_time_raw.replace('Z', '+00:00')).replace(tzinfo=None)
+                if datetime.utcnow() >= target_time:
+                    exit_price = current_price or (float(pred.get('actual_price')) if pred.get('actual_price') is not None else entry_price)
+                    close_status = 'cerrada_normal'
         else:
-            pred = (daily_status.get(t['daily_prediction_id']) if t['prediction_type'] == 'daily'
-                    else intraday_status.get(t['intraday_prediction_id']))
+            pred = daily_status.get(t['daily_prediction_id'])
             if pred and pred.get('status') == 'closed':
-                exit_price = float(pred.get('actual_final_price') or pred.get('actual_price') or current_price or entry_price)
+                exit_price = float(pred.get('actual_final_price') or current_price or entry_price)
                 close_status = 'cerrada_normal'
 
         if not close_status:
