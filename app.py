@@ -2817,6 +2817,272 @@ def predict_lgbm_batch():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
+# ── Etapa 30: motor de trading automático (hoy sólo papel) ────────────────────
+# Corre vía cron (mismo patrón de auth que el resto de este archivo: _check_secret() +
+# XGB_INTERNAL_SECRET), determinístico — sin LLM en el loop. Decide entradas/salidas de
+# `auto_trades` contra el filtro de costo IOL + el gate estadístico de `scorecard_bolsas` + los
+# límites de riesgo de `auto_trading_config`. Ver REDISENO/ETAPA-30-motor-trading-automatico.md.
+#
+# Comisiones IOL: mismos números que `routeInstrument()`/`DEFAULT_COSTO_CONFIG` en
+# dashboard/lib/tracking.ts (Fase A/B de la Etapa 30) — duplicado acá porque este código corre en
+# Python vía cron y no puede importar TS. Si se recalibra uno, recalibrar el otro.
+AUTO_COSTO_PCT = {
+    'BYMA': {'normal': 1.33, 'intradia': 0.67},
+    'US':   {'normal': 0.85, 'intradia': 0.85},
+}
+
+DEFAULT_STOP_LOSS_PCT = -2.0  # fallback si la predicción no trae stop_loss_pct sugerido
+
+
+def _auto_route(core_bucket):
+    """Espejo de routeInstrument() en dashboard/lib/tracking.ts. 'cedear_underlying' no resuelve
+    acá la contraparte 'us' de la misma compañía (a diferencia de la versión TS con
+    hasUsCounterpart) — simplificación de esta primera versión: esas filas quedan sin venue
+    (informativas, no se operan) hasta que se necesite ese mapeo."""
+    if core_bucket in ('us', 'adr_arg'):
+        return 'US'
+    if core_bucket in ('cedear_arg', 'accion_arg_local'):
+        return 'BYMA'
+    return None
+
+
+def _auto_costo_pct(venue, is_intraday):
+    return AUTO_COSTO_PCT.get(venue, {}).get('intradia' if is_intraday else 'normal')
+
+
+def _run_motor_entradas(sb, source):
+    """source: 'intraday' (todos los horizontes) | 'daily' (sólo h=1). Evalúa predicciones
+    abiertas nuevas contra costo + gate estadístico + riesgo, y abre `auto_trades` en papel donde
+    corresponda. No abre nada si el kill switch está prendido, no hay portfolio para la moneda, o
+    el gate estadístico no pasa — eso es comportamiento correcto, no una falla."""
+    cfg = (sb.from_('auto_trading_config').select('*').eq('id', True).single().execute().data) or {}
+    if cfg.get('kill_switch', True):
+        return {'ok': True, 'skipped': 'kill_switch', 'opened': 0}
+
+    portfolios = {p['currency']: p for p in (sb.from_('auto_portfolios').select('*').execute().data or [])}
+    if not portfolios:
+        return {'ok': True, 'skipped': 'no_portfolios', 'opened': 0}
+
+    all_trades = sb.from_('auto_trades').select(
+        'id, portfolio_id, status, closed_at, pnl_monto, daily_prediction_id, intraday_prediction_id'
+    ).execute().data or []
+    open_trades = [t for t in all_trades if t['status'] == 'abierta']
+    already_traded_pred_ids = (
+        {t['daily_prediction_id'] for t in all_trades if t.get('daily_prediction_id')} |
+        {t['intraday_prediction_id'] for t in all_trades if t.get('intraday_prediction_id')}
+    )
+
+    slots_left = int(cfg.get('max_concurrent_positions', 10)) - len(open_trades)
+    if slots_left <= 0:
+        return {'ok': True, 'skipped': 'max_concurrent_positions', 'opened': 0}
+
+    today = datetime.utcnow().date().isoformat()
+    daily_pnl_by_portfolio = defaultdict(float)
+    for t in all_trades:
+        if t.get('closed_at') and str(t['closed_at'])[:10] == today and t.get('pnl_monto') is not None:
+            daily_pnl_by_portfolio[t['portfolio_id']] += float(t['pnl_monto'])
+    blocked_portfolio_ids = set()
+    for pf in portfolios.values():
+        loss_limit = -abs(float(cfg.get('max_daily_loss_pct', 3))) / 100.0 * float(pf['capital_inicial'])
+        if daily_pnl_by_portfolio.get(pf['id'], 0.0) <= loss_limit:
+            blocked_portfolio_ids.add(pf['id'])
+
+    scorecard = sb.from_('scorecard_bolsas').select(
+        'asset_id, currency, horizon_unit, horizon_bucket, estado, expectancy_net_pct'
+    ).execute().data or []
+    scorecard_by_key = {(s['asset_id'], s['currency'], s['horizon_unit'], s['horizon_bucket']): s for s in scorecard}
+
+    assets_by_id = {a['id']: a for a in (
+        sb.from_('assets').select('id, ticker, currency, core_bucket').execute().data or [])}
+
+    if source == 'intraday':
+        preds = sb.from_('consensus_predictions_intraday').select(
+            'id, asset_id, direction, horizon_minutes, status, price_at_creation, final_pct_predicted, stop_loss_pct'
+        ).eq('status', 'open').eq('direction', 'up').execute().data or []
+        horizon_unit = 'minutes'
+    else:
+        preds = sb.from_('consensus_predictions').select(
+            'id, asset_id, direction, horizon_days, status, price_at_creation, final_pct_predicted, stop_loss_pct'
+        ).eq('status', 'open').eq('direction', 'up').eq('horizon_days', 1).execute().data or []
+        horizon_unit = 'days'
+
+    opened, skipped_reasons = 0, defaultdict(int)
+    for p in preds:
+        if slots_left <= 0:
+            break
+        pred_id = p['id']
+        if pred_id in already_traded_pred_ids:
+            continue
+        asset = assets_by_id.get(p['asset_id'])
+        if not asset:
+            skipped_reasons['sin_asset'] += 1
+            continue
+
+        venue = _auto_route(asset.get('core_bucket'))
+        if not venue:
+            skipped_reasons['sin_venue'] += 1
+            continue
+
+        horizon_value = p['horizon_minutes'] if source == 'intraday' else p['horizon_days']
+        costo_pct = _auto_costo_pct(venue, is_intraday=(source == 'intraday'))
+        movimiento_esperado = abs(float(p.get('final_pct_predicted') or 0))
+        if costo_pct is None or movimiento_esperado <= costo_pct:
+            skipped_reasons['no_supera_costo'] += 1
+            continue
+
+        bolsa = scorecard_by_key.get((p['asset_id'], asset['currency'], horizon_unit, int(horizon_value)))
+        expectancy = float(bolsa['expectancy_net_pct']) if bolsa and bolsa.get('expectancy_net_pct') is not None else None
+        estado = bolsa['estado'] if bolsa else 'sin_datos'
+        if estado != 'validado' or expectancy is None or expectancy <= 0:
+            skipped_reasons['gate_estadistico'] += 1
+            continue
+
+        pf = portfolios.get(asset['currency'])
+        if not pf:
+            skipped_reasons['sin_portfolio'] += 1
+            continue
+        if pf['id'] in blocked_portfolio_ids:
+            skipped_reasons['daily_loss_limit'] += 1
+            continue
+
+        entry_price = float(p.get('price_at_creation') or 0)
+        if entry_price <= 0:
+            skipped_reasons['sin_precio'] += 1
+            continue
+
+        monto_invertido = float(pf['capital_inicial']) * float(cfg.get('max_position_pct_capital', 2)) / 100.0
+        cantidad = monto_invertido / entry_price
+        stop_loss_usado = float(p['stop_loss_pct']) if p.get('stop_loss_pct') is not None else DEFAULT_STOP_LOSS_PCT
+
+        sb.from_('auto_trades').insert({
+            'portfolio_id': pf['id'], 'asset_id': p['asset_id'], 'prediction_type': source,
+            'daily_prediction_id': pred_id if source == 'daily' else None,
+            'intraday_prediction_id': pred_id if source == 'intraday' else None,
+            'direction': 'up', 'venue': venue, 'modo': 'papel',
+            'horizon_value': horizon_value, 'horizon_unit': horizon_unit,
+            'bolsa_estado_al_entrar': estado, 'bolsa_expectancy_net_at_entry': expectancy,
+            'monto_invertido': monto_invertido, 'cantidad': cantidad,
+            'stop_loss_sugerido_pct': p.get('stop_loss_pct'), 'stop_loss_usado_pct': stop_loss_usado,
+            'take_profit_pct': None, 'entry_price': entry_price,
+        }).execute()
+        opened += 1
+        slots_left -= 1
+
+    return {'ok': True, 'opened': opened, 'evaluated': len(preds), 'skipped': dict(skipped_reasons)}
+
+
+def _get_latest_prices(sb, asset_ids):
+    """Último precio conocido por activo: `indicators_intraday.price_close` (más fresco, cada
+    ~10 min en horario de mercado) con fallback a `price_history.close` (cierre diario) para
+    activos sin fila intradiaria reciente — cubre tanto auto_trades intradiarios como diarios."""
+    asset_ids = list(asset_ids)
+    if not asset_ids:
+        return {}
+    prices = {}
+    ii = sb.from_('indicators_intraday').select('asset_id, price_close, calculated_at') \
+        .in_('asset_id', asset_ids).order('calculated_at', desc=True).execute().data or []
+    for row in ii:
+        if row['asset_id'] not in prices and row.get('price_close') is not None:
+            prices[row['asset_id']] = float(row['price_close'])
+    missing = [a for a in asset_ids if a not in prices]
+    if missing:
+        ph = sb.from_('price_history').select('asset_id, close, trade_date') \
+            .in_('asset_id', missing).order('trade_date', desc=True).execute().data or []
+        for row in ph:
+            if row['asset_id'] not in prices and row.get('close') is not None:
+                prices[row['asset_id']] = float(row['close'])
+    return prices
+
+
+def _run_motor_salidas(sb):
+    """Cierra `auto_trades` abiertas por stop-loss, take-profit, o cierre de la predicción que las
+    originó. pnl_pct/pnl_monto quedan netos de la comisión IOL del venue (mismo principio que el
+    filtro de costo: la magnitud bruta no es el número que importa)."""
+    open_trades = sb.from_('auto_trades').select(
+        'id, asset_id, venue, prediction_type, daily_prediction_id, intraday_prediction_id, '
+        'entry_price, cantidad, monto_invertido, stop_loss_usado_pct, take_profit_pct'
+    ).eq('status', 'abierta').execute().data or []
+    if not open_trades:
+        return {'ok': True, 'closed': 0}
+
+    daily_pred_ids = [t['daily_prediction_id'] for t in open_trades if t.get('daily_prediction_id')]
+    intraday_pred_ids = [t['intraday_prediction_id'] for t in open_trades if t.get('intraday_prediction_id')]
+    daily_status = {p['id']: p for p in (
+        sb.from_('consensus_predictions').select('id, status, actual_final_price')
+        .in_('id', daily_pred_ids).execute().data or [])} if daily_pred_ids else {}
+    intraday_status = {p['id']: p for p in (
+        sb.from_('consensus_predictions_intraday').select('id, status, actual_price')
+        .in_('id', intraday_pred_ids).execute().data or [])} if intraday_pred_ids else {}
+
+    latest_prices = _get_latest_prices(sb, {t['asset_id'] for t in open_trades})
+
+    closed = 0
+    for t in open_trades:
+        entry_price = float(t['entry_price'])
+        current_price = latest_prices.get(t['asset_id'])
+        gross_pct_now = ((current_price - entry_price) / entry_price * 100.0) if current_price else None
+
+        exit_price, close_status = None, None
+        if t.get('take_profit_pct') is not None and gross_pct_now is not None and gross_pct_now >= t['take_profit_pct']:
+            exit_price, close_status = current_price, 'cerrada_por_take_profit'
+        elif gross_pct_now is not None and gross_pct_now <= t['stop_loss_usado_pct']:
+            exit_price, close_status = current_price, 'cerrada_por_stop'
+        else:
+            pred = (daily_status.get(t['daily_prediction_id']) if t['prediction_type'] == 'daily'
+                    else intraday_status.get(t['intraday_prediction_id']))
+            if pred and pred.get('status') == 'closed':
+                exit_price = float(pred.get('actual_final_price') or pred.get('actual_price') or current_price or entry_price)
+                close_status = 'cerrada_normal'
+
+        if not close_status:
+            continue
+
+        costo_pct = _auto_costo_pct(t['venue'], is_intraday=(t['prediction_type'] == 'intraday')) or 0.0
+        gross_pct = (exit_price - entry_price) / entry_price * 100.0
+        pnl_pct = gross_pct - costo_pct
+        pnl_monto = pnl_pct / 100.0 * float(t['monto_invertido'])
+
+        sb.from_('auto_trades').update({
+            'status': close_status, 'exit_price': exit_price,
+            'pnl_pct': pnl_pct, 'pnl_monto': pnl_monto,
+            'closed_at': datetime.utcnow().isoformat(),
+        }).eq('id', t['id']).execute()
+        closed += 1
+
+    return {'ok': True, 'closed': closed, 'evaluated': len(open_trades)}
+
+
+@app.route('/api/motor_ejecucion', methods=['POST', 'OPTIONS'])
+def motor_ejecucion():
+    """Etapa 30 — motor de trading automático (hoy sólo papel, ver REDISENO/ETAPA-30). Disparado
+    por cron poco después de cada tanda de predicciones nuevas.
+    body: {"source": "intraday"|"daily", "phase": "entradas"|"salidas"|"ambas" (default "ambas")}.
+    Evalúa salidas antes que entradas cuando phase="ambas", para liberar cupo de posiciones
+    concurrentes en la misma corrida."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    body = request.get_json() or {}
+    source = body.get('source', 'intraday')
+    phase = body.get('phase', 'ambas')
+    if source not in ('intraday', 'daily'):
+        return jsonify({'ok': False, 'error': 'source debe ser intraday|daily'}), 400
+    if phase not in ('entradas', 'salidas', 'ambas'):
+        return jsonify({'ok': False, 'error': 'phase debe ser entradas|salidas|ambas'}), 400
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        result = {}
+        if phase in ('salidas', 'ambas'):
+            result['salidas'] = _run_motor_salidas(sb)
+        if phase in ('entradas', 'ambas'):
+            result['entradas'] = _run_motor_entradas(sb, source)
+        return jsonify({'ok': True, **result})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
 # ── APScheduler: auto-train daily at 21:30 UTC ────────────────────────────────
 
 def _keep_alive_loop(stop_event: threading.Event):
