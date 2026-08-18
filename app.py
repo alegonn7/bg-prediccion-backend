@@ -2850,6 +2850,105 @@ def _auto_costo_pct(venue, is_intraday):
     return AUTO_COSTO_PCT.get(venue, {}).get('intradia' if is_intraday else 'normal')
 
 
+# ── Etapa 30 (continuación, 18/08/2026): cliente REST real de IOL para operar en vivo ─────────
+# Contrato confirmado contra la documentación oficial (api.invertironline.com/Help/Autenticacion)
+# más una implementación de referencia real y funcionando (github.com/pgallar/iol-mcp, revisada el
+# 18/08/2026) — no adivinado. Credenciales por env var (IOL_USERNAME/IOL_PASSWORD en Render, nunca
+# en este repo ni en una tabla). Pedido explícito del usuario: operar en vivo YA, salteando el gate
+# estadístico a sabiendas de que hoy no hay ninguna bolsa validada (ver ETAPA-30). No hay endpoint
+# nativo de stop-loss/take-profit confirmado en la referencia disponible — se implementa por
+# polling (mismo chequeo de precio que ya hace _run_motor_salidas cada 15 min) más una orden de
+# venta REAL cuando se dispara, en vez de adivinar un endpoint no documentado para algo que manda
+# plata real.
+IOL_BASE_URL = 'https://api.invertironline.com'
+IOL_USERNAME = os.environ.get('IOL_USERNAME', '')
+IOL_PASSWORD = os.environ.get('IOL_PASSWORD', '')
+_iol_token_cache = {'access_token': None, 'expiry': None}
+
+IOL_MERCADO_ARS = 'bCBA'
+_IOL_MERCADO_BY_EXCHANGE = {'NASDAQ': 'nASDAQ', 'NYSE': 'nYSE', 'AMEX': 'aMEX'}
+
+
+def _iol_mercado_for(venue, exchange):
+    if venue == 'BYMA':
+        return IOL_MERCADO_ARS
+    return _IOL_MERCADO_BY_EXCHANGE.get((exchange or '').upper(), 'nYSE')
+
+
+def _iol_authenticate():
+    import httpx
+    resp = httpx.post(
+        f'{IOL_BASE_URL}/token',
+        data={'username': IOL_USERNAME, 'password': IOL_PASSWORD, 'grant_type': 'password'},
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    _iol_token_cache['access_token'] = data['access_token']
+    _iol_token_cache['expiry'] = (
+        datetime.utcnow() + timedelta(seconds=int(data['expires_in'])) - timedelta(minutes=2)
+    )
+
+
+def _iol_headers():
+    if (not _iol_token_cache['access_token'] or not _iol_token_cache['expiry']
+            or datetime.utcnow() >= _iol_token_cache['expiry']):
+        _iol_authenticate()
+    return {'Authorization': f"Bearer {_iol_token_cache['access_token']}", 'Content-Type': 'application/json'}
+
+
+def _iol_request(method, path, **kwargs):
+    import httpx
+    headers = _iol_headers()
+    resp = httpx.request(method, f'{IOL_BASE_URL}{path}', headers=headers, timeout=20, **kwargs)
+    if resp.status_code == 401:
+        _iol_authenticate()
+        headers = _iol_headers()
+        resp = httpx.request(method, f'{IOL_BASE_URL}{path}', headers=headers, timeout=20, **kwargs)
+    resp.raise_for_status()
+    return resp.json() if resp.text else {}
+
+
+def _iol_estado_cuenta():
+    return _iol_request('GET', '/api/v2/estadocuenta')
+
+
+def _iol_available_ars_cash():
+    """Busca el efectivo disponible en pesos en la respuesta de estadocuenta — el shape exacto no
+    se pudo confirmar sin credenciales reales, así que busca de forma defensiva en vez de asumir
+    una ruta fija, y devuelve None (nunca una excepción) si no lo encuentra, para que el llamador
+    salte la entrada en lugar de arriesgar un tamaño de posición mal calculado."""
+    try:
+        data = _iol_estado_cuenta()
+        for cuenta in data.get('cuentas', []) or []:
+            moneda = str(cuenta.get('moneda', '')).lower()
+            if 'peso' in moneda or moneda == 'ars':
+                disponible = cuenta.get('disponible')
+                if disponible is not None:
+                    return float(disponible)
+        return None
+    except Exception as e:
+        print(f'[iol_estado_cuenta] error: {e}', flush=True)
+        return None
+
+
+def _iol_comprar(mercado, simbolo, precio, cantidad):
+    validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
+    return _iol_request('POST', '/api/v2/operar/Comprar', json={
+        'mercado': mercado, 'simbolo': simbolo, 'precio': precio, 'plazo': 't0',
+        'validez': validez, 'cantidad': cantidad, 'tipoOrden': 'precioMercado',
+    })
+
+
+def _iol_vender(mercado, simbolo, precio, cantidad):
+    validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
+    return _iol_request('POST', '/api/v2/operar/Vender', json={
+        'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad, 'precio': precio,
+        'validez': validez, 'plazo': 't0', 'tipoOrden': 'precioMercado',
+    })
+
+
 def _run_motor_entradas(sb, source):
     """source: 'intraday' (todos los horizontes) | 'daily' (sólo h=1). Evalúa predicciones
     abiertas nuevas contra costo + gate estadístico + riesgo, y abre `auto_trades` en papel donde
@@ -2893,7 +2992,7 @@ def _run_motor_entradas(sb, source):
     scorecard_by_key = {(s['asset_id'], s['currency'], s['horizon_unit'], s['horizon_bucket']): s for s in scorecard}
 
     assets_by_id = {a['id']: a for a in (
-        sb.from_('assets').select('id, ticker, currency, core_bucket').execute().data or [])}
+        sb.from_('assets').select('id, ticker, currency, core_bucket, exchange').execute().data or [])}
 
     if source == 'intraday':
         preds = sb.from_('consensus_predictions_intraday').select(
@@ -2933,9 +3032,14 @@ def _run_motor_entradas(sb, source):
         bolsa = scorecard_by_key.get((p['asset_id'], asset['currency'], horizon_unit, int(horizon_value)))
         expectancy = float(bolsa['expectancy_net_pct']) if bolsa and bolsa.get('expectancy_net_pct') is not None else None
         estado = bolsa['estado'] if bolsa else 'sin_datos'
-        if estado != 'validado' or expectancy is None or expectancy <= 0:
-            skipped_reasons['gate_estadistico'] += 1
-            continue
+        # Etapa 30 (continuación): override_statistical_gate, a pedido explícito del usuario, salta
+        # este chequeo a sabiendas de que hoy no hay ninguna bolsa validada — el resto de los
+        # filtros (costo, riesgo) se mantienen intactos. Default false: sin tocar la config, el
+        # comportamiento es exactamente el de antes.
+        if not cfg.get('override_statistical_gate', False):
+            if estado != 'validado' or expectancy is None or expectancy <= 0:
+                skipped_reasons['gate_estadistico'] += 1
+                continue
 
         pf = portfolios.get(asset['currency'])
         if not pf:
@@ -2950,20 +3054,56 @@ def _run_motor_entradas(sb, source):
             skipped_reasons['sin_precio'] += 1
             continue
 
-        monto_invertido = float(pf['capital_inicial']) * float(cfg.get('max_position_pct_capital', 2)) / 100.0
-        cantidad = monto_invertido / entry_price
+        # Etapa 30 (continuación): modo vivo, habilitado por venue (live_enabled_byma/_us). Usa
+        # efectivo REAL (estado de cuenta de IOL en el momento, no el capital_inicial de papel) y
+        # coloca una orden de compra real. Si algo falla (auth, DDJJ requerido, fondos
+        # insuficientes, lo que sea) se salta esta entrada sin tocar `auto_trades` — nunca se
+        # inserta una fila 'vivo' sin una orden real detrás.
+        live_enabled = (
+            (venue == 'BYMA' and cfg.get('live_enabled_byma', False)) or
+            (venue == 'US' and cfg.get('live_enabled_us', False))
+        )
+        modo = 'papel'
+        iol_buy_order_id = None
+        if live_enabled:
+            cash = _iol_available_ars_cash() if venue == 'BYMA' else None  # sólo BYMA implementado hoy
+            if cash is None or cash <= 0:
+                skipped_reasons['vivo_sin_efectivo'] += 1
+                continue
+            monto_invertido = cash * float(cfg.get('live_position_pct', 90)) / 100.0
+            cantidad = int(monto_invertido / entry_price)  # unidades enteras — IOL no fracciona acciones/CEDEARs
+            if cantidad < 1:
+                skipped_reasons['vivo_monto_insuficiente'] += 1
+                continue
+            mercado = _iol_mercado_for(venue, asset.get('exchange'))
+            try:
+                orden = _iol_comprar(mercado, asset['ticker'], entry_price, cantidad)
+                iol_buy_order_id = orden.get('numeroOperacion') or orden.get('numero') or orden.get('id')
+                modo = 'vivo'
+                monto_invertido = cantidad * entry_price
+                print(f'[motor_ejecucion] VIVO: compra real {asset["ticker"]} x{cantidad} '
+                      f'@ {entry_price} — orden {iol_buy_order_id}', flush=True)
+            except Exception as e:
+                print(f'[motor_ejecucion] VIVO: compra real de {asset["ticker"]} fallo: {e}', flush=True)
+                skipped_reasons['vivo_orden_fallo'] += 1
+                continue
+        else:
+            monto_invertido = float(pf['capital_inicial']) * float(cfg.get('max_position_pct_capital', 2)) / 100.0
+            cantidad = monto_invertido / entry_price
+
         stop_loss_usado = float(p['stop_loss_pct']) if p.get('stop_loss_pct') is not None else DEFAULT_STOP_LOSS_PCT
 
         sb.from_('auto_trades').insert({
             'portfolio_id': pf['id'], 'asset_id': p['asset_id'], 'prediction_type': source,
             'daily_prediction_id': pred_id if source == 'daily' else None,
             'intraday_prediction_id': pred_id if source == 'intraday' else None,
-            'direction': 'up', 'venue': venue, 'modo': 'papel',
+            'direction': 'up', 'venue': venue, 'modo': modo,
             'horizon_value': horizon_value, 'horizon_unit': horizon_unit,
             'bolsa_estado_al_entrar': estado, 'bolsa_expectancy_net_at_entry': expectancy,
             'monto_invertido': monto_invertido, 'cantidad': cantidad,
             'stop_loss_sugerido_pct': p.get('stop_loss_pct'), 'stop_loss_usado_pct': stop_loss_usado,
             'take_profit_pct': None, 'entry_price': entry_price,
+            'iol_buy_order_id': iol_buy_order_id,
         }).execute()
         opened += 1
         slots_left -= 1
@@ -2999,11 +3139,15 @@ def _run_motor_salidas(sb):
     originó. pnl_pct/pnl_monto quedan netos de la comisión IOL del venue (mismo principio que el
     filtro de costo: la magnitud bruta no es el número que importa)."""
     open_trades = sb.from_('auto_trades').select(
-        'id, asset_id, venue, prediction_type, daily_prediction_id, intraday_prediction_id, '
+        'id, asset_id, venue, modo, prediction_type, daily_prediction_id, intraday_prediction_id, '
         'entry_price, cantidad, monto_invertido, stop_loss_usado_pct, take_profit_pct'
     ).eq('status', 'abierta').execute().data or []
     if not open_trades:
         return {'ok': True, 'closed': 0}
+
+    assets_by_id = {a['id']: a for a in (
+        sb.from_('assets').select('id, ticker, exchange').in_(
+            'id', list({t['asset_id'] for t in open_trades})).execute().data or [])}
 
     daily_pred_ids = [t['daily_prediction_id'] for t in open_trades if t.get('daily_prediction_id')]
     intraday_pred_ids = [t['intraday_prediction_id'] for t in open_trades if t.get('intraday_prediction_id')]
@@ -3037,6 +3181,29 @@ def _run_motor_salidas(sb):
         if not close_status:
             continue
 
+        # Etapa 30 (continuación): modo vivo vende de verdad antes de marcar la fila como cerrada.
+        # Si la venta real falla, la fila queda abierta (se reintenta el próximo ciclo) — nunca se
+        # marca 'cerrada' sin una orden real detrás, para que auto_trades no mienta sobre lo que
+        # pasó con la plata real.
+        iol_sell_order_id = None
+        if t.get('modo') == 'vivo':
+            asset = assets_by_id.get(t['asset_id'])
+            cantidad_vender = int(t['cantidad'] or 0)
+            if not asset or cantidad_vender < 1:
+                print(f'[motor_ejecucion] VIVO: no se pudo vender trade {t["id"]} '
+                      f'(asset o cantidad inválida)', flush=True)
+                continue
+            mercado = _iol_mercado_for(t['venue'], asset.get('exchange'))
+            try:
+                orden = _iol_vender(mercado, asset['ticker'], exit_price, cantidad_vender)
+                iol_sell_order_id = orden.get('numeroOperacion') or orden.get('numero') or orden.get('id')
+                print(f'[motor_ejecucion] VIVO: venta real {asset["ticker"]} x{cantidad_vender} '
+                      f'@ {exit_price} ({close_status}) — orden {iol_sell_order_id}', flush=True)
+            except Exception as e:
+                print(f'[motor_ejecucion] VIVO: venta real de trade {t["id"]} fallo: {e} '
+                      f'— queda abierta, se reintenta', flush=True)
+                continue
+
         costo_pct = _auto_costo_pct(t['venue'], is_intraday=(t['prediction_type'] == 'intraday')) or 0.0
         gross_pct = (exit_price - entry_price) / entry_price * 100.0
         pnl_pct = gross_pct - costo_pct
@@ -3046,6 +3213,7 @@ def _run_motor_salidas(sb):
             'status': close_status, 'exit_price': exit_price,
             'pnl_pct': pnl_pct, 'pnl_monto': pnl_monto,
             'closed_at': datetime.utcnow().isoformat(),
+            'iol_sell_order_id': iol_sell_order_id,
         }).eq('id', t['id']).execute()
         closed += 1
 
