@@ -3093,8 +3093,17 @@ def _run_motor_entradas(sb, source):
         # coloca una orden de compra real. Si algo falla (auth, DDJJ requerido, fondos
         # insuficientes, lo que sea) se salta esta entrada sin tocar `auto_trades` — nunca se
         # inserta una fila 'vivo' sin una orden real detrás.
+        # Etapa 30 (continuación, 19/08/2026 — hallazgo real con la cuenta real): los CEDEARs
+        # (core_bucket='cedear_arg') exigen una declaración jurada (DDJJ) POR ORDEN, no una vez
+        # para siempre — se probó aceptándola para las 33 y volvió a pedirla en la siguiente orden.
+        # Sin un humano confirmando cada vez, esto rompe el "zero-touch": no hay endpoint para
+        # aceptarla sin que alguien lea el texto en el momento. Las acciones argentinas locales
+        # (core_bucket='accion_arg_local') NO son CEDEARs y no piden nada de esto (confirmado con
+        # GGAL, `validate_order` real). Por eso el modo vivo se restringe a accion_arg_local — los
+        # CEDEARs se quedan en papel, no porque no califiquen sino porque la orden real fallaría
+        # siempre por la DDJJ.
         live_enabled = (
-            (venue == 'BYMA' and cfg.get('live_enabled_byma', False)) or
+            (venue == 'BYMA' and cfg.get('live_enabled_byma', False) and asset.get('core_bucket') != 'cedear_arg') or
             (venue == 'US' and cfg.get('live_enabled_us', False))
         )
         modo = 'papel'
