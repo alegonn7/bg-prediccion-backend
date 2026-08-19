@@ -2838,10 +2838,16 @@ def _auto_route(core_bucket):
     """Espejo de routeInstrument() en dashboard/lib/tracking.ts. 'cedear_underlying' no resuelve
     acá la contraparte 'us' de la misma compañía (a diferencia de la versión TS con
     hasUsCounterpart) — simplificación de esta primera versión: esas filas quedan sin venue
-    (informativas, no se operan) hasta que se necesite ese mapeo."""
+    (informativas, no se operan) hasta que se necesite ese mapeo.
+
+    Etapa 30 (continuación, 19/08/2026, a pedido explícito del usuario): 'cedear_arg' SACADO del
+    motor de trading por completo (ni papel ni vivo) — la declaración jurada que exige IOL es por
+    orden, sin forma de dejarla aceptada de antemano, así que nunca puede operar en vivo, y
+    mantenerlo sólo en papel ya no aporta (probado con la cuenta real el 19/08). El sistema de
+    predicciones/scorecard de CEDEARs sigue intacto, esto es sólo el motor de trading."""
     if core_bucket in ('us', 'adr_arg'):
         return 'US'
-    if core_bucket in ('cedear_arg', 'accion_arg_local'):
+    if core_bucket == 'accion_arg_local':
         return 'BYMA'
     return None
 
@@ -2933,20 +2939,45 @@ def _iol_available_ars_cash():
         return None
 
 
-def _iol_comprar(mercado, simbolo, precio, cantidad):
+def _iol_available_usd_cash():
+    """Efectivo disponible en dólares de la Cuenta Estados Unidos específicamente
+    (`tipo='inversion_Estados_Unidos_Dolares'`, confirmado con la cuenta real el 19/08/2026) — NO
+    la sub-cuenta en dólares del lado Argentina (`inversion_Argentina_Dolares`), que es una cuenta
+    distinta con otro `numero`."""
+    try:
+        data = _iol_estado_cuenta()
+        for cuenta in data.get('cuentas', []) or []:
+            if cuenta.get('tipo') == 'inversion_Estados_Unidos_Dolares':
+                disponible = cuenta.get('disponible')
+                if disponible is not None:
+                    return float(disponible)
+        return None
+    except Exception as e:
+        print(f'[iol_estado_cuenta] error: {e}', flush=True)
+        return None
+
+
+def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
     return _iol_request('POST', '/api/v2/operar/Comprar', json={
-        'mercado': mercado, 'simbolo': simbolo, 'precio': precio, 'plazo': 't0',
+        'mercado': mercado, 'simbolo': simbolo, 'precio': precio, 'plazo': plazo,
         'validez': validez, 'cantidad': cantidad, 'tipoOrden': 'precioMercado',
     })
 
 
-def _iol_vender(mercado, simbolo, precio, cantidad):
+def _iol_vender(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
     return _iol_request('POST', '/api/v2/operar/Vender', json={
         'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad, 'precio': precio,
-        'validez': validez, 'plazo': 't0', 'tipoOrden': 'precioMercado',
+        'validez': validez, 'plazo': plazo, 'tipoOrden': 'precioMercado',
     })
+
+
+def _iol_plazo_for(venue):
+    """t0 (Contado Inmediato) vale en BCBA; NASDAQ/NYSE lo rechaza (probado con la cuenta real,
+    AAPL) — requiere t1. No bloquea operar la misma posición el mismo día, es sólo cuándo liquida
+    contablemente, no una restricción de day-trading."""
+    return 't0' if venue == 'BYMA' else 't1'
 
 
 def _run_motor_entradas(sb, source):
@@ -2982,16 +3013,19 @@ def _run_motor_entradas(sb, source):
     if slots_left <= 0:
         return {'ok': True, 'skipped': 'max_concurrent_positions', 'opened': 0}
 
-    # Etapa 30 (continuación): reparto explícito de capital real entre intradiario y diario h=1
-    # (pedido del usuario: $8.000/$2.000) — cuánto de la asignación de ESTE `source` ya está
-    # comprometido en posiciones vivo abiertas, para no pasarse del tope al dimensionar una entrada
-    # nueva más abajo.
-    live_committed_this_source = sum(
-        float(t['monto_invertido']) for t in open_trades
-        if t.get('modo') == 'vivo' and t.get('venue') == 'BYMA' and t.get('prediction_type') == source
-    )
-    live_capital_cap = float(cfg.get(
-        'live_capital_intraday_ars' if source == 'intraday' else 'live_capital_daily_ars', 0))
+    # Etapa 30 (continuación, 19/08/2026, a pedido explícito del usuario): reparto explícito de
+    # capital real por MERCADO (Argentina/EEUU) — reemplaza el reparto anterior por horizonte
+    # (intradiario/diario). Cuánto de la asignación de CADA venue ya está comprometido en
+    # posiciones vivo abiertas, para no pasarse del tope al dimensionar una entrada nueva más abajo.
+    # Así EEUU queda listo para usarse solo en cuanto haya más dólares depositados.
+    live_committed_by_venue = defaultdict(float)
+    for t in open_trades:
+        if t.get('modo') == 'vivo':
+            live_committed_by_venue[t.get('venue')] += float(t['monto_invertido'])
+    live_capital_cap_by_venue = {
+        'BYMA': float(cfg.get('live_capital_ars', 0)),
+        'US': float(cfg.get('live_capital_usd', 0)),
+    }
 
     today = datetime.utcnow().date().isoformat()
     daily_pnl_by_portfolio = defaultdict(float)
@@ -3007,12 +3041,15 @@ def _run_motor_entradas(sb, source):
     # todavía sin cerrar, así que subestima el capital total mientras algo está invertido, lo cual
     # empuja el freno a activarse ANTES de lo estrictamente necesario — más conservador, no al revés.
     real_ars_cash = _iol_available_ars_cash() if cfg.get('live_enabled_byma', False) else None
+    real_usd_cash = _iol_available_usd_cash() if cfg.get('live_enabled_us', False) else None
 
     blocked_portfolio_ids = set()
     for pf in portfolios.values():
         pnl_today = daily_pnl_by_portfolio.get(pf['id'], 0.0)
         if pf['currency'] == 'ars' and real_ars_cash is not None:
             capital_base = real_ars_cash - pnl_today
+        elif pf['currency'] == 'usd' and real_usd_cash is not None:
+            capital_base = real_usd_cash - pnl_today
         else:
             capital_base = float(pf['capital_inicial'])
         loss_limit = -abs(float(cfg.get('max_daily_loss_pct', 3))) / 100.0 * capital_base
@@ -3109,13 +3146,13 @@ def _run_motor_entradas(sb, source):
         modo = 'papel'
         iol_buy_order_id = None
         if live_enabled:
-            cash = _iol_available_ars_cash() if venue == 'BYMA' else None  # sólo BYMA implementado hoy
+            cash = _iol_available_ars_cash() if venue == 'BYMA' else _iol_available_usd_cash()
             if cash is None or cash <= 0:
                 skipped_reasons['vivo_sin_efectivo'] += 1
                 continue
-            # Reparto explícito por source (Etapa 30 continuación) — nunca comprometer más del tope
-            # asignado a intradiario/diario, aunque sobre efectivo real de la otra asignación.
-            remaining_allocation = max(0.0, live_capital_cap - live_committed_this_source)
+            # Reparto explícito por MERCADO (Etapa 30 continuación) — nunca comprometer más del
+            # tope asignado a Argentina/EEUU, aunque sobre efectivo real de la otra moneda.
+            remaining_allocation = max(0.0, live_capital_cap_by_venue.get(venue, 0.0) - live_committed_by_venue[venue])
             budget = min(remaining_allocation, cash)
             monto_invertido = budget * float(cfg.get('live_position_pct', 90)) / 100.0
             cantidad = int(monto_invertido / entry_price)  # unidades enteras — IOL no fracciona acciones/CEDEARs
@@ -3123,14 +3160,15 @@ def _run_motor_entradas(sb, source):
                 skipped_reasons['vivo_monto_insuficiente'] += 1
                 continue
             mercado = _iol_mercado_for(venue, asset.get('exchange'))
+            plazo = _iol_plazo_for(venue)
             try:
-                orden = _iol_comprar(mercado, asset['ticker'], entry_price, cantidad)
+                orden = _iol_comprar(mercado, asset['ticker'], entry_price, cantidad, plazo=plazo)
                 iol_buy_order_id = orden.get('numeroOperacion') or orden.get('numero') or orden.get('id')
                 modo = 'vivo'
                 monto_invertido = cantidad * entry_price
-                live_committed_this_source += monto_invertido
+                live_committed_by_venue[venue] += monto_invertido
                 print(f'[motor_ejecucion] VIVO: compra real {asset["ticker"]} x{cantidad} '
-                      f'@ {entry_price} — orden {iol_buy_order_id}', flush=True)
+                      f'@ {entry_price} ({mercado}/{plazo}) — orden {iol_buy_order_id}', flush=True)
             except Exception as e:
                 print(f'[motor_ejecucion] VIVO: compra real de {asset["ticker"]} fallo: {e}', flush=True)
                 skipped_reasons['vivo_orden_fallo'] += 1
@@ -3269,8 +3307,9 @@ def _run_motor_salidas(sb):
                       f'(asset o cantidad inválida)', flush=True)
                 continue
             mercado = _iol_mercado_for(t['venue'], asset.get('exchange'))
+            plazo = _iol_plazo_for(t['venue'])
             try:
-                orden = _iol_vender(mercado, asset['ticker'], exit_price, cantidad_vender)
+                orden = _iol_vender(mercado, asset['ticker'], exit_price, cantidad_vender, plazo=plazo)
                 iol_sell_order_id = orden.get('numeroOperacion') or orden.get('numero') or orden.get('id')
                 print(f'[motor_ejecucion] VIVO: venta real {asset["ticker"]} x{cantidad_vender} '
                       f'@ {exit_price} ({close_status}) — orden {iol_sell_order_id}', flush=True)
