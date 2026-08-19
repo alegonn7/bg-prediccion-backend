@@ -3013,19 +3013,25 @@ def _run_motor_entradas(sb, source):
     if slots_left <= 0:
         return {'ok': True, 'skipped': 'max_concurrent_positions', 'opened': 0}
 
-    # Etapa 30 (continuación, 19/08/2026, a pedido explícito del usuario): reparto explícito de
-    # capital real por MERCADO (Argentina/EEUU) — reemplaza el reparto anterior por horizonte
-    # (intradiario/diario). Cuánto de la asignación de CADA venue ya está comprometido en
-    # posiciones vivo abiertas, para no pasarse del tope al dimensionar una entrada nueva más abajo.
-    # Así EEUU queda listo para usarse solo en cuanto haya más dólares depositados.
-    live_committed_by_venue = defaultdict(float)
-    for t in open_trades:
-        if t.get('modo') == 'vivo':
-            live_committed_by_venue[t.get('venue')] += float(t['monto_invertido'])
+    # Etapa 30 (continuación, 19/08/2026, corregido a pedido explícito del usuario tras un
+    # malentendido): en Argentina (BYMA) el reparto es por HORIZONTE ($10.000 intradiario / $2.000
+    # diario, cada `source` con su propio tope — mismo mecanismo que la primera versión). En EEUU
+    # (hoy deshabilitado, `live_enabled_us=false`) es un solo pool sin sub-repartir por horizonte —
+    # no hace falta esa finura mientras el capital ahí sea tan chico, y así queda listo para
+    # activarse solo el día que haya más dólares, sin volver a tocar este código.
+    live_committed_byma_this_source = sum(
+        float(t['monto_invertido']) for t in open_trades
+        if t.get('modo') == 'vivo' and t.get('venue') == 'BYMA' and t.get('prediction_type') == source
+    )
+    live_committed_us = sum(
+        float(t['monto_invertido']) for t in open_trades
+        if t.get('modo') == 'vivo' and t.get('venue') == 'US'
+    )
     live_capital_cap_by_venue = {
-        'BYMA': float(cfg.get('live_capital_ars', 0)),
+        'BYMA': float(cfg.get('live_capital_intraday_ars' if source == 'intraday' else 'live_capital_daily_ars', 0)),
         'US': float(cfg.get('live_capital_usd', 0)),
     }
+    live_committed_by_venue = {'BYMA': live_committed_byma_this_source, 'US': live_committed_us}
 
     today = datetime.utcnow().date().isoformat()
     daily_pnl_by_portfolio = defaultdict(float)
