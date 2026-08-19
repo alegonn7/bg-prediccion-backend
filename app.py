@@ -2920,41 +2920,37 @@ def _iol_estado_cuenta():
     return _iol_request('GET', '/api/v2/estadocuenta')
 
 
-def _iol_available_ars_cash():
-    """Busca el efectivo disponible en pesos en la respuesta de estadocuenta — el shape exacto no
-    se pudo confirmar sin credenciales reales, así que busca de forma defensiva en vez de asumir
-    una ruta fija, y devuelve None (nunca una excepción) si no lo encuentra, para que el llamador
-    salte la entrada en lugar de arriesgar un tamaño de posición mal calculado."""
+def _iol_available_cash_both():
+    """Efectivo disponible real en pesos y en dólares (Cuenta Estados Unidos específicamente,
+    `tipo='inversion_Estados_Unidos_Dolares'` — NO la sub-cuenta en dólares del lado Argentina,
+    que es una cuenta distinta con otro `numero`) en una sola llamada a estadocuenta — el shape
+    exacto no se pudo confirmar sin credenciales reales, así que busca de forma defensiva en vez de
+    asumir una ruta fija. Devuelve (None, None) en error, nunca una excepción, para que el
+    llamador salte la entrada en lugar de arriesgar un tamaño de posición mal calculado."""
     try:
         data = _iol_estado_cuenta()
+        ars, usd = None, None
         for cuenta in data.get('cuentas', []) or []:
             moneda = str(cuenta.get('moneda', '')).lower()
-            if 'peso' in moneda or moneda == 'ars':
-                disponible = cuenta.get('disponible')
-                if disponible is not None:
-                    return float(disponible)
-        return None
+            disponible = cuenta.get('disponible')
+            if disponible is None:
+                continue
+            if ars is None and ('peso' in moneda or moneda == 'ars'):
+                ars = float(disponible)
+            if usd is None and cuenta.get('tipo') == 'inversion_Estados_Unidos_Dolares':
+                usd = float(disponible)
+        return ars, usd
     except Exception as e:
         print(f'[iol_estado_cuenta] error: {e}', flush=True)
-        return None
+        return None, None
+
+
+def _iol_available_ars_cash():
+    return _iol_available_cash_both()[0]
 
 
 def _iol_available_usd_cash():
-    """Efectivo disponible en dólares de la Cuenta Estados Unidos específicamente
-    (`tipo='inversion_Estados_Unidos_Dolares'`, confirmado con la cuenta real el 19/08/2026) — NO
-    la sub-cuenta en dólares del lado Argentina (`inversion_Argentina_Dolares`), que es una cuenta
-    distinta con otro `numero`."""
-    try:
-        data = _iol_estado_cuenta()
-        for cuenta in data.get('cuentas', []) or []:
-            if cuenta.get('tipo') == 'inversion_Estados_Unidos_Dolares':
-                disponible = cuenta.get('disponible')
-                if disponible is not None:
-                    return float(disponible)
-        return None
-    except Exception as e:
-        print(f'[iol_estado_cuenta] error: {e}', flush=True)
-        return None
+    return _iol_available_cash_both()[1]
 
 
 def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
@@ -2986,6 +2982,21 @@ def _run_motor_entradas(sb, source):
     corresponda. No abre nada si el kill switch está prendido, no hay portfolio para la moneda, o
     el gate estadístico no pasa — eso es comportamiento correcto, no una falla."""
     cfg = (sb.from_('auto_trading_config').select('*').eq('id', True).single().execute().data) or {}
+
+    # Etapa 30 (continuación, 19/08/2026, a pedido explícito del usuario): guarda una foto del
+    # efectivo real en cada corrida, para que el dashboard lo muestre sin necesitar acceso directo
+    # a IOL (que no tiene). Se hace ANTES del corte por kill_switch, para que la foto se mantenga
+    # fresca incluso con el motor frenado.
+    snapshot_ars, snapshot_usd = _iol_available_cash_both()
+    if snapshot_ars is not None or snapshot_usd is not None:
+        snap_update = {'last_known_cash_at': datetime.utcnow().isoformat()}
+        if snapshot_ars is not None:
+            snap_update['last_known_ars_cash'] = snapshot_ars
+        if snapshot_usd is not None:
+            snap_update['last_known_usd_cash'] = snapshot_usd
+        sb.from_('auto_trading_config').update(snap_update).eq('id', True).execute()
+        cfg.update(snap_update)
+
     if cfg.get('kill_switch', True):
         return {'ok': True, 'skipped': 'kill_switch', 'opened': 0}
 
@@ -3046,8 +3057,10 @@ def _run_motor_entradas(sb, source):
     # efectivo actual menos lo ya ganado/perdido hoy — no incluye el valor de posiciones abiertas
     # todavía sin cerrar, así que subestima el capital total mientras algo está invertido, lo cual
     # empuja el freno a activarse ANTES de lo estrictamente necesario — más conservador, no al revés.
-    real_ars_cash = _iol_available_ars_cash() if cfg.get('live_enabled_byma', False) else None
-    real_usd_cash = _iol_available_usd_cash() if cfg.get('live_enabled_us', False) else None
+    # Reusa la foto ya tomada al principio de la función — no hace falta pedirle a IOL el mismo
+    # dato dos veces en la misma corrida.
+    real_ars_cash = snapshot_ars if cfg.get('live_enabled_byma', False) else None
+    real_usd_cash = snapshot_usd if cfg.get('live_enabled_us', False) else None
 
     blocked_portfolio_ids = set()
     for pf in portfolios.values():
