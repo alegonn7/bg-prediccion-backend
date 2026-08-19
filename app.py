@@ -3039,7 +3039,7 @@ def _run_motor_entradas(sb, source):
         ).eq('status', 'open').eq('direction', 'up').eq('horizon_days', 1).execute().data or []
         horizon_unit = 'days'
 
-    opened, skipped_reasons = 0, defaultdict(int)
+    opened, skipped_reasons, live_errors = 0, defaultdict(int), []
     for p in preds:
         if slots_left <= 0:
             break
@@ -3125,6 +3125,8 @@ def _run_motor_entradas(sb, source):
             except Exception as e:
                 print(f'[motor_ejecucion] VIVO: compra real de {asset["ticker"]} fallo: {e}', flush=True)
                 skipped_reasons['vivo_orden_fallo'] += 1
+                if len(live_errors) < 10:  # acotado — esto es diagnóstico, no un log completo
+                    live_errors.append(f'{asset["ticker"]} ({mercado}) x{cantidad}: {str(e)[:200]}')
                 continue
         else:
             monto_invertido = float(pf['capital_inicial']) * float(cfg.get('max_position_pct_capital', 2)) / 100.0
@@ -3147,7 +3149,8 @@ def _run_motor_entradas(sb, source):
         opened += 1
         slots_left -= 1
 
-    return {'ok': True, 'opened': opened, 'evaluated': len(preds), 'skipped': dict(skipped_reasons)}
+    return {'ok': True, 'opened': opened, 'evaluated': len(preds), 'skipped': dict(skipped_reasons),
+            'live_errors': live_errors}
 
 
 def _get_latest_prices(sb, asset_ids):
