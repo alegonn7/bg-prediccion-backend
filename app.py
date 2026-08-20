@@ -3020,8 +3020,14 @@ def _run_motor_entradas(sb, source):
         {t['intraday_prediction_id'] for t in all_trades if t.get('intraday_prediction_id')}
     )
 
-    slots_left = int(cfg.get('max_concurrent_positions', 10)) - len(open_trades)
-    if slots_left <= 0:
+    # Etapa 30 (fix 20/08/2026, bug real encontrado en producción: 10 posiciones en papel llenaban
+    # max_concurrent_positions y con eso bloqueaban también el cupo de vivo, aunque nunca hubiera
+    # ninguna posición vivo abierta todavía). Cupos separados por modo — papel y vivo compiten cada
+    # uno sólo contra su propio conteo, uno no le saca lugar al otro.
+    max_positions = int(cfg.get('max_concurrent_positions', 10))
+    slots_left_papel = max_positions - sum(1 for t in open_trades if t.get('modo') != 'vivo')
+    slots_left_vivo = max_positions - sum(1 for t in open_trades if t.get('modo') == 'vivo')
+    if slots_left_papel <= 0 and slots_left_vivo <= 0:
         return {'ok': True, 'skipped': 'max_concurrent_positions', 'opened': 0}
 
     # Etapa 30 (continuación, 19/08/2026, corregido a pedido explícito del usuario tras un
@@ -3097,7 +3103,7 @@ def _run_motor_entradas(sb, source):
 
     opened, skipped_reasons, live_errors = 0, defaultdict(int), []
     for p in preds:
-        if slots_left <= 0:
+        if slots_left_papel <= 0 and slots_left_vivo <= 0:
             break
         pred_id = p['id']
         if pred_id in already_traded_pred_ids:
@@ -3162,6 +3168,13 @@ def _run_motor_entradas(sb, source):
             (venue == 'BYMA' and cfg.get('live_enabled_byma', False) and asset.get('core_bucket') != 'cedear_arg') or
             (venue == 'US' and cfg.get('live_enabled_us', False))
         )
+        if live_enabled and slots_left_vivo <= 0:
+            skipped_reasons['max_concurrent_positions_vivo'] += 1
+            continue
+        if not live_enabled and slots_left_papel <= 0:
+            skipped_reasons['max_concurrent_positions_papel'] += 1
+            continue
+
         modo = 'papel'
         iol_buy_order_id = None
         if live_enabled:
@@ -3213,7 +3226,10 @@ def _run_motor_entradas(sb, source):
             'iol_buy_order_id': iol_buy_order_id,
         }).execute()
         opened += 1
-        slots_left -= 1
+        if modo == 'vivo':
+            slots_left_vivo -= 1
+        else:
+            slots_left_papel -= 1
 
     return {'ok': True, 'opened': opened, 'evaluated': len(preds), 'skipped': dict(skipped_reasons),
             'live_errors': live_errors}
