@@ -2965,10 +2965,17 @@ def _iol_simbolo_for(ticker):
     return ticker[:-3] if ticker.endswith('.BA') else ticker
 
 
+# Etapa 30 (fix 25/08/2026, segundo bug real en la misma corrida: confirmado con
+# mcp__claude_ai_IOL__validate_order contra la cuenta real, código MS-ORD-0033 — "Una orden a
+# Precio de Mercado no puede tener un precio límite"): `precio` NO se manda en el body a IOL —
+# se sigue recibiendo como parámetro porque el llamador lo necesita para calcular
+# monto_invertido, pero incluirlo en el JSON junto con tipoOrden='precioMercado' hace que IOL
+# rechace la orden entera con 400. Este proyecto sólo opera a mercado, nunca a precio límite, así
+# que no hay ningún caso donde 'precio' deba viajar en el body.
 def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
     return _iol_request('POST', '/api/v2/operar/Comprar', json={
-        'mercado': mercado, 'simbolo': simbolo, 'precio': precio, 'plazo': plazo,
+        'mercado': mercado, 'simbolo': simbolo, 'plazo': plazo,
         'validez': validez, 'cantidad': cantidad, 'tipoOrden': 'precioMercado',
     })
 
@@ -2976,7 +2983,7 @@ def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
 def _iol_vender(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
     return _iol_request('POST', '/api/v2/operar/Vender', json={
-        'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad, 'precio': precio,
+        'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad,
         'validez': validez, 'plazo': plazo, 'tipoOrden': 'precioMercado',
     })
 
