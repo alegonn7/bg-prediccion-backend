@@ -2974,20 +2974,20 @@ def _iol_simbolo_for(ticker):
     return ticker[:-3] if ticker.endswith('.BA') else ticker
 
 
-# Etapa 30 (fix 25/08/2026, corregido dos veces la misma tarde — ver REDISENO/ETAPA-30 para el
-# historial completo): el intento anterior de este fix sacaba 'precio' del body entero, basado en
-# un rechazo de validate_order (MCP) que en realidad era un guard propio del conector, no de la
-# API real de IOL. Confirmado contra la referencia real y funcionando (github.com/pgallar/iol-mcp,
-# src/iol/operar/client.py, OperarClient.comprar): 'precio' SIEMPRE viaja en el body, incluso a
-# mercado — no es opcional. Además esa referencia soporta un campo 'monto' (monto efectivo a
-# invertir) además de 'cantidad', ambos opcionales — el rechazo real de IOL en producción
-# ("Cargar campo monto mayor a 0") pedía justo ese campo. Se agrega calculado a partir de
-# cantidad×precio, sin cambiar la cantidad de acciones que ya decide _run_motor_entradas.
+# Etapa 30 (fix 25/08/2026, tercera vuelta la misma tarde — ver REDISENO/ETAPA-30 para el
+# historial completo de los 400 reales encontrados en orden): 'precio' siempre viaja (no es
+# opcional, confirmado contra la referencia real github.com/pgallar/iol-mcp,
+# src/iol/operar/client.py). 'cantidad' y 'monto' son ambos opcionales ahí, pero IOL en
+# producción rechazó mandar los dos juntos en una orden a mercado: "Precio mercado no debe tener
+# cantidad" — a mercado hay que decirle CUÁNTA PLATA gastar (monto), no cuántas acciones, y deja
+# que la cotización del momento determine cuántas entran. `cantidad` sigue siendo un parámetro de
+# esta función (el llamador la sigue calculando para saber cuántas acciones espera que entren y
+# poder registrar auto_trades), sólo se dejó de mandar en el body.
 def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
     return _iol_request('POST', '/api/v2/operar/Comprar', json={
         'mercado': mercado, 'simbolo': simbolo, 'precio': precio, 'plazo': plazo,
-        'validez': validez, 'cantidad': cantidad, 'monto': round(cantidad * precio, 2),
+        'validez': validez, 'monto': round(cantidad * precio, 2),
         'tipoOrden': 'precioMercado',
     })
 
