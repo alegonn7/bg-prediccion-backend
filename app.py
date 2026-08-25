@@ -2987,29 +2987,41 @@ def _iol_simbolo_for(ticker):
     return ticker[:-3] if ticker.endswith('.BA') else ticker
 
 
-# Etapa 30 (fix 25/08/2026, tercera vuelta la misma tarde — ver REDISENO/ETAPA-30 para el
-# historial completo de los 400 reales encontrados en orden): 'precio' siempre viaja (no es
-# opcional, confirmado contra la referencia real github.com/pgallar/iol-mcp,
-# src/iol/operar/client.py). 'cantidad' y 'monto' son ambos opcionales ahí, pero IOL en
-# producción rechazó mandar los dos juntos en una orden a mercado: "Precio mercado no debe tener
-# cantidad" — a mercado hay que decirle CUÁNTA PLATA gastar (monto), no cuántas acciones, y deja
-# que la cotización del momento determine cuántas entran. `cantidad` sigue siendo un parámetro de
-# esta función (el llamador la sigue calculando para saber cuántas acciones espera que entren y
-# poder registrar auto_trades), sólo se dejó de mandar en el body.
+# Etapa 30 (fix 25/08/2026, cuarta vuelta la misma tarde — ver REDISENO/ETAPA-30 para el
+# historial completo): con `tipoOrden='precioMercado'` se probaron 4 variantes de campos contra la
+# cuenta real (sufijo de ticker, con/sin 'precio', con/sin 'cantidad'/'monto') hasta que la orden
+# dejó de ser rechazada — pero el HTTP "éxito" trajo el body VACÍO y no confirmó nada real (cero
+# plata movida, verificado contra get_portfolio/get_activities/get_balance reales — ver "Hallazgo
+# grave" en REDISENO/ETAPA-30). Investigado en implementaciones reales de la comunidad
+# (github.com/fernandezpablo85/mcpiol, iol-api-client-guide.md): el patrón documentado y usado en
+# la práctica NO usa 'tipoOrden' en absoluto — manda 'cantidad' + 'precio' juntos (orden límite
+# implícita), coincide con que 'precioMercado' sea el camino menos transitado/con más aristas de
+# la API real. Se abandona 'precioMercado'/'monto' por una orden límite con un margen chico sobre
+# el precio de referencia (0,5%, `_ORDEN_PRECIO_BUFFER_PCT`) para que en la práctica llene casi
+# como si fuera a mercado, sin ser una orden de precio ilimitado — protección extra que un mercado
+# puro no tiene, razonable dado que `precio` viene de una predicción de hasta ~15 min de
+# antigüedad. TODAVÍA NO PROBADO CONTRA LA CUENTA REAL (mercado cerrado al escribir esto) —
+# primer paso de la próxima sesión con mercado abierto: verificar de nuevo contra
+# get_portfolio/get_activities/get_balance reales antes de confiar en que "no hubo excepción"
+# significa que se compró de verdad — no volver a asumirlo a partir sólo del HTTP status.
+_ORDEN_PRECIO_BUFFER_PCT = 0.5
+
+
 def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
+    precio_limite = round(precio * (1 + _ORDEN_PRECIO_BUFFER_PCT / 100), 2)
     return _iol_request('POST', '/api/v2/operar/Comprar', json={
-        'mercado': mercado, 'simbolo': simbolo, 'precio': precio, 'plazo': plazo,
-        'validez': validez, 'monto': round(cantidad * precio, 2),
-        'tipoOrden': 'precioMercado',
+        'mercado': mercado, 'simbolo': simbolo, 'precio': precio_limite, 'plazo': plazo,
+        'validez': validez, 'cantidad': cantidad,
     })
 
 
 def _iol_vender(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
+    precio_limite = round(precio * (1 - _ORDEN_PRECIO_BUFFER_PCT / 100), 2)
     return _iol_request('POST', '/api/v2/operar/Vender', json={
-        'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad, 'precio': precio,
-        'validez': validez, 'plazo': plazo, 'tipoOrden': 'precioMercado',
+        'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad, 'precio': precio_limite,
+        'validez': validez, 'plazo': plazo,
     })
 
 
