@@ -2912,7 +2912,16 @@ def _iol_request(method, path, **kwargs):
         _iol_authenticate()
         headers = _iol_headers()
         resp = httpx.request(method, f'{IOL_BASE_URL}{path}', headers=headers, timeout=20, **kwargs)
-    resp.raise_for_status()
+    # Etapa 30 (25/08/2026): resp.raise_for_status() (versión anterior) sólo daba el status y la
+    # URL (ej. "400 Bad Request"), sin el cuerpo de la respuesta -- que es justo donde IOL manda
+    # el motivo real del rechazo (ej. {"codigo":"MS-ORD-0033","mensaje":"Una orden a Precio de
+    # Mercado no puede tener un precio límite"}, el error real detrás de dos bugs seguidos en esta
+    # misma sesión). Diagnosticar un 400 real obligaba a reproducirlo a mano contra validate_order
+    # (MCP) en vez de leerlo directo de los logs. Ahora el texto de la excepción incluye el body
+    # entero -- visible en los print() de _run_motor_entradas/_run_motor_salidas (logs de Render)
+    # y en el campo `live_errors` de la respuesta de /api/motor_ejecucion.
+    if resp.status_code >= 400:
+        raise Exception(f'{resp.status_code} {resp.reason_phrase}: {resp.text[:500]}')
     return resp.json() if resp.text else {}
 
 
