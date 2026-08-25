@@ -2953,6 +2953,18 @@ def _iol_available_usd_cash():
     return _iol_available_cash_both()[1]
 
 
+def _iol_simbolo_for(ticker):
+    """IOL espera el ticker pelado, sin sufijo de exchange — este proyecto guarda los activos
+    BYMA (accion_arg_local) con sufijo '.BA' (convención estilo Yahoo Finance, usada en
+    predicciones/UI), pero la API real de IOL rechaza eso con 400 Bad Request. Confirmado
+    25/08/2026: 'LOMA.BA' -> 400 al comprar de verdad; el mismo ticker sin sufijo ('LOMA', mercado
+    BCBA) valida OK contra la API real de IOL. Esto explica por qué auto_trades nunca tuvo una
+    sola fila modo='vivo' pese a que cash/DDJJ/gate ya estaban resueltos — cada intento de compra
+    real fallaba acá, silenciosamente (skipped_reasons['vivo_orden_fallo'], sin persistir el motivo
+    exacto). Único caso conocido: los tickers de EEUU/ADR (venue 'US') no llevan sufijo."""
+    return ticker[:-3] if ticker.endswith('.BA') else ticker
+
+
 def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
     return _iol_request('POST', '/api/v2/operar/Comprar', json={
@@ -3194,7 +3206,7 @@ def _run_motor_entradas(sb, source):
             mercado = _iol_mercado_for(venue, asset.get('exchange'))
             plazo = _iol_plazo_for(venue)
             try:
-                orden = _iol_comprar(mercado, asset['ticker'], entry_price, cantidad, plazo=plazo)
+                orden = _iol_comprar(mercado, _iol_simbolo_for(asset['ticker']), entry_price, cantidad, plazo=plazo)
                 iol_buy_order_id = orden.get('numeroOperacion') or orden.get('numero') or orden.get('id')
                 modo = 'vivo'
                 monto_invertido = cantidad * entry_price
@@ -3344,7 +3356,7 @@ def _run_motor_salidas(sb):
             mercado = _iol_mercado_for(t['venue'], asset.get('exchange'))
             plazo = _iol_plazo_for(t['venue'])
             try:
-                orden = _iol_vender(mercado, asset['ticker'], exit_price, cantidad_vender, plazo=plazo)
+                orden = _iol_vender(mercado, _iol_simbolo_for(asset['ticker']), exit_price, cantidad_vender, plazo=plazo)
                 iol_sell_order_id = orden.get('numeroOperacion') or orden.get('numero') or orden.get('id')
                 print(f'[motor_ejecucion] VIVO: venta real {asset["ticker"]} x{cantidad_vender} '
                       f'@ {exit_price} ({close_status}) — orden {iol_sell_order_id}', flush=True)
