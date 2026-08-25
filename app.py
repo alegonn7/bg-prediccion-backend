@@ -2974,25 +2974,28 @@ def _iol_simbolo_for(ticker):
     return ticker[:-3] if ticker.endswith('.BA') else ticker
 
 
-# Etapa 30 (fix 25/08/2026, segundo bug real en la misma corrida: confirmado con
-# mcp__claude_ai_IOL__validate_order contra la cuenta real, código MS-ORD-0033 — "Una orden a
-# Precio de Mercado no puede tener un precio límite"): `precio` NO se manda en el body a IOL —
-# se sigue recibiendo como parámetro porque el llamador lo necesita para calcular
-# monto_invertido, pero incluirlo en el JSON junto con tipoOrden='precioMercado' hace que IOL
-# rechace la orden entera con 400. Este proyecto sólo opera a mercado, nunca a precio límite, así
-# que no hay ningún caso donde 'precio' deba viajar en el body.
+# Etapa 30 (fix 25/08/2026, corregido dos veces la misma tarde — ver REDISENO/ETAPA-30 para el
+# historial completo): el intento anterior de este fix sacaba 'precio' del body entero, basado en
+# un rechazo de validate_order (MCP) que en realidad era un guard propio del conector, no de la
+# API real de IOL. Confirmado contra la referencia real y funcionando (github.com/pgallar/iol-mcp,
+# src/iol/operar/client.py, OperarClient.comprar): 'precio' SIEMPRE viaja en el body, incluso a
+# mercado — no es opcional. Además esa referencia soporta un campo 'monto' (monto efectivo a
+# invertir) además de 'cantidad', ambos opcionales — el rechazo real de IOL en producción
+# ("Cargar campo monto mayor a 0") pedía justo ese campo. Se agrega calculado a partir de
+# cantidad×precio, sin cambiar la cantidad de acciones que ya decide _run_motor_entradas.
 def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
     return _iol_request('POST', '/api/v2/operar/Comprar', json={
-        'mercado': mercado, 'simbolo': simbolo, 'plazo': plazo,
-        'validez': validez, 'cantidad': cantidad, 'tipoOrden': 'precioMercado',
+        'mercado': mercado, 'simbolo': simbolo, 'precio': precio, 'plazo': plazo,
+        'validez': validez, 'cantidad': cantidad, 'monto': round(cantidad * precio, 2),
+        'tipoOrden': 'precioMercado',
     })
 
 
 def _iol_vender(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
     return _iol_request('POST', '/api/v2/operar/Vender', json={
-        'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad,
+        'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad, 'precio': precio,
         'validez': validez, 'plazo': plazo, 'tipoOrden': 'precioMercado',
     })
 
