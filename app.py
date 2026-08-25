@@ -3004,7 +3004,20 @@ def _iol_simbolo_for(ticker):
 # primer paso de la próxima sesión con mercado abierto: verificar de nuevo contra
 # get_portfolio/get_activities/get_balance reales antes de confiar en que "no hubo excepción"
 # significa que se compró de verdad — no volver a asumirlo a partir sólo del HTTP status.
-_ORDEN_PRECIO_BUFFER_PCT = 0.5
+#
+# Etapa 30 (corrección el mismo día, a los minutos de subir esto): 0.5% estaba mal calibrado —
+# elegido por "suena razonable para que llene", sin cruzarlo contra el filtro de costo. El motor
+# sólo entra cuando el movimiento esperado supera el costo IOL (0.67% intradía ARS) — un candidato
+# típico que recién pasa ese filtro (ej. LOMA hoy: +0.88%) tiene un margen neto de apenas ~0.21%
+# antes de este buffer. Un buffer de 0.5% se come ese margen entero y da vuelta la operación de
+# ganadora a perdedora aunque la dirección predicha sea correcta — un costo de ejecución más caro
+# que la comisión misma. Bajado a 0.1% (~15% del costo mínimo, no la mitad) — sigue dando margen
+# para que la orden límite llene sin acercarse a borrar el edge. Esto es un parche, no la solución
+# de fondo: el buffer existe para cubrir que `precio` (price_at_creation de la predicción) puede
+# estar minutos u horas desactualizado al momento real de la orden — la solución de fondo sería
+# pedir una cotización fresca justo antes de mandar la orden en vez de confiar en un precio viejo,
+# no hecho todavía (anotado junto al pedido de reconciliar contra el precio de ejecución real).
+_ORDEN_PRECIO_BUFFER_PCT = 0.1
 
 
 def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
