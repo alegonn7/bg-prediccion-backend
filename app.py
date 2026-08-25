@@ -2922,7 +2922,20 @@ def _iol_request(method, path, **kwargs):
     # y en el campo `live_errors` de la respuesta de /api/motor_ejecucion.
     if resp.status_code >= 400:
         raise Exception(f'{resp.status_code} {resp.reason_phrase}: {resp.text[:500]}')
-    return resp.json() if resp.text else {}
+    # Etapa 30 (25/08/2026, hallazgo grave, confirmado con la cuenta real vía MCP —
+    # get_portfolio/get_activities/get_balance — DESPUÉS de que el motor ya había creado 2 filas
+    # auto_trades modo='vivo' creyendo que la compra de LOMA.BA había salido bien): la orden real
+    # devolvió éxito HTTP con el body VACÍO, y el código anterior (`resp.json() if resp.text else
+    # {}`) trataba eso como una respuesta válida — nunca se movió un peso ni apareció la operación
+    # en la cuenta real. La referencia funcionando (github.com/pgallar/iol-mcp,
+    # src/iol/http_client.py) nunca contempla un body vacío como éxito — siempre asume JSON real
+    # en 200/201. Un body vacío ahora es un error, no un `{}` silencioso — con el status code real
+    # en el mensaje (200/201/202/lo que sea) para poder diagnosticar la próxima vez sin tener que
+    # reproducirlo contra la cuenta real de nuevo. Filas de auto_trades ya creadas por el bug
+    # viejo se borraron a mano (25/08/2026) — no son reales, no había ninguna operación detrás.
+    if not resp.text:
+        raise Exception(f'{resp.status_code} {resp.reason_phrase}: respuesta vacía (sin body) — no se puede confirmar la orden')
+    return resp.json()
 
 
 def _iol_estado_cuenta():
@@ -3232,6 +3245,15 @@ def _run_motor_entradas(sb, source):
                 live_committed_by_venue[venue] += monto_invertido
                 print(f'[motor_ejecucion] VIVO: compra real {asset["ticker"]} x{cantidad} '
                       f'@ {entry_price} ({mercado}/{plazo}) — orden {iol_buy_order_id}', flush=True)
+                if iol_buy_order_id is None:
+                    # Etapa 30 (25/08/2026): en la primera compra real de la historia del proyecto
+                    # (LOMA.BA, 17:39 UTC) ninguno de los 3 nombres de campo probados matcheó — la
+                    # compra igual se registró bien (modo='vivo', monto correcto), sólo faltó el
+                    # id de la orden para poder rastrearla después. Se loguea la respuesta cruda
+                    # completa para ver el shape real en los logs de Render la próxima vez, en vez
+                    # de seguir adivinando nombres de campo contra la cuenta real.
+                    print(f'[motor_ejecucion] VIVO: orden de {asset["ticker"]} sin id reconocido, '
+                          f'respuesta cruda: {orden}', flush=True)
             except Exception as e:
                 print(f'[motor_ejecucion] VIVO: compra real de {asset["ticker"]} fallo: {e}', flush=True)
                 skipped_reasons['vivo_orden_fallo'] += 1
