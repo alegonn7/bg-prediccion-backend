@@ -3139,9 +3139,14 @@ def _run_motor_entradas_inner(sb, source):
     # max_concurrent_positions y con eso bloqueaban también el cupo de vivo, aunque nunca hubiera
     # ninguna posición vivo abierta todavía). Cupos separados por modo — papel y vivo compiten cada
     # uno sólo contra su propio conteo, uno no le saca lugar al otro.
+    # Etapa 30 (26/08/2026): mismo criterio que el fix de capital comprometido más abajo -- una
+    # fila 'vivo' sin `iol_buy_order_id` (BBAR.BA/TXAR.BA hoy: `_iol_comprar` no tiró excepción
+    # pero tampoco devolvió ningún id reconocido, y no hay ninguna orden real detrás) no debería
+    # ocupar un cupo real de `max_concurrent_positions_vivo` tampoco.
     max_positions = int(cfg.get('max_concurrent_positions', 10))
     slots_left_papel = max_positions - sum(1 for t in open_trades if t.get('modo') != 'vivo')
-    slots_left_vivo = max_positions - sum(1 for t in open_trades if t.get('modo') == 'vivo')
+    slots_left_vivo = max_positions - sum(
+        1 for t in open_trades if t.get('modo') == 'vivo' and t.get('iol_buy_order_id'))
     if slots_left_papel <= 0 and slots_left_vivo <= 0:
         return {'ok': True, 'skipped': 'max_concurrent_positions', 'opened': 0}
 
