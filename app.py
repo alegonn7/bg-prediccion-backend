@@ -3442,7 +3442,28 @@ def _get_latest_prices(sb, asset_ids):
     return prices
 
 
+_SALIDAS_LOCK_TIMEOUT_MIN = 3
+
+
 def _run_motor_salidas(sb):
+    """Wrapper con lock: sólo una corrida de salidas puede estar activa a la vez. Etapa 30
+    (26/08/2026, hallazgo real): salidas corre cada 2 min via cron sin ningún lock -- entradas ya
+    tenía uno desde antes, salidas no. Los fixes de esta misma sesión agregaron llamadas reales a
+    IOL por cada trade abierto (confirmar compra, confirmar venta), así que cada ciclo ahora tarda
+    más -- si una corrida se pasa de 2 minutos (Render free tier ya mostró estar lento hoy), la
+    siguiente podría arrancar mientras la anterior sigue viva y las dos intentar vender la misma
+    posición. Mismo patrón ya probado para entradas (try_acquire_entradas_lock), probado igual
+    directo con SQL antes de conectarlo acá."""
+    got_lock = sb.rpc('try_acquire_salidas_lock', {'p_timeout_min': _SALIDAS_LOCK_TIMEOUT_MIN}).execute().data
+    if not got_lock:
+        return {'ok': True, 'skipped': 'ya_corriendo'}
+    try:
+        return _run_motor_salidas_inner(sb)
+    finally:
+        sb.rpc('release_salidas_lock', {}).execute()
+
+
+def _run_motor_salidas_inner(sb):
     """Cierra `auto_trades` abiertas por stop-loss, take-profit, o cierre de la predicción que las
     originó. pnl_pct/pnl_monto quedan netos de la comisión IOL del venue (mismo principio que el
     filtro de costo: la magnitud bruta no es el número que importa)."""
