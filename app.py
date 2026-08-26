@@ -3508,15 +3508,23 @@ def _run_motor_salidas_inner(sb):
         if t.get('modo') == 'vivo' and t.get('iol_sell_order_id'):
             try:
                 op = _iol_estado_operacion(t['iol_sell_order_id'])
-                ejecuciones = op.get('executions') or []
+                # Etapa 30 (26/08/2026, bug real encontrado en producción, en el fix de HOY mismo):
+                # la API cruda de IOL devuelve nombres de campo en español (`operaciones`,
+                # `cantidad`, `precio`) -- NO `executions`/`quantity`/`price` (esos son los nombres
+                # que usa el MCP de diagnóstico para MOSTRAR la respuesta, ya traducidos, no lo que
+                # manda IOL de verdad). Confirmado con un endpoint de diagnóstico temporal contra la
+                # cuenta real. Con los nombres en inglés, `ejecuciones` daba siempre vacío y esto
+                # trataba CUALQUIER orden, sin importar cuánto hacía que había llenado, como "0
+                # ejecutado" para siempre -- nunca confirmaba nada, ni compras ni ventas.
+                ejecuciones = op.get('operaciones') or []
                 cantidad_total = float(t['cantidad'] or 0)
-                cantidad_ejecutada = sum(float(e.get('quantity') or 0) for e in ejecuciones)
+                cantidad_ejecutada = sum(float(e.get('cantidad') or 0) for e in ejecuciones)
                 if cantidad_ejecutada < cantidad_total - 0.0001:
                     print(f'[motor_ejecucion] VIVO: venta de trade {t["id"]} (orden '
                           f'{t["iol_sell_order_id"]}) todavía no se ejecutó ({cantidad_ejecutada}/'
                           f'{cantidad_total}) -- se deja abierta, se reconfirma el próximo ciclo', flush=True)
                     continue
-                valor_total = sum(float(e.get('quantity') or 0) * float(e.get('price') or 0) for e in ejecuciones)
+                valor_total = sum(float(e.get('cantidad') or 0) * float(e.get('precio') or 0) for e in ejecuciones)
                 exit_price = (valor_total / cantidad_ejecutada) if cantidad_ejecutada > 0 else entry_price
                 if t.get('take_profit_pct') is not None and gross_pct_now is not None and gross_pct_now >= t['take_profit_pct']:
                     close_status = 'cerrada_por_take_profit'
@@ -3555,12 +3563,20 @@ def _run_motor_salidas_inner(sb):
                 continue
             try:
                 op = _iol_estado_operacion(t['iol_buy_order_id'])
-                ejecuciones = op.get('executions') or []
+                # Etapa 30 (26/08/2026, bug real encontrado en producción, en el fix de HOY mismo):
+                # la API cruda de IOL devuelve nombres de campo en español (`operaciones`,
+                # `cantidad`, `precio`) -- NO `executions`/`quantity`/`price` (esos son los nombres
+                # que usa el MCP de diagnóstico para MOSTRAR la respuesta, ya traducidos, no lo que
+                # manda IOL de verdad). Confirmado con un endpoint de diagnóstico temporal contra la
+                # cuenta real. Con los nombres en inglés, `ejecuciones` daba siempre vacío y esto
+                # trataba CUALQUIER orden, sin importar cuánto hacía que había llenado, como "0
+                # ejecutado" para siempre -- nunca confirmaba nada, ni compras ni ventas.
+                ejecuciones = op.get('operaciones') or []
                 cantidad_total = float(t['cantidad'] or 0)
-                cantidad_ejecutada = sum(float(e.get('quantity') or 0) for e in ejecuciones)
+                cantidad_ejecutada = sum(float(e.get('cantidad') or 0) for e in ejecuciones)
                 if cantidad_ejecutada < cantidad_total - 0.0001:
                     continue
-                valor_total = sum(float(e.get('quantity') or 0) * float(e.get('price') or 0) for e in ejecuciones)
+                valor_total = sum(float(e.get('cantidad') or 0) * float(e.get('precio') or 0) for e in ejecuciones)
                 entry_price_real = (valor_total / cantidad_ejecutada) if cantidad_ejecutada > 0 else entry_price
                 if abs(entry_price_real - entry_price) > 0.0001:
                     sb.from_('auto_trades').update({'entry_price': entry_price_real}).eq('id', t['id']).execute()
