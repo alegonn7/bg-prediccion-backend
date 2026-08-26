@@ -3045,7 +3045,37 @@ def _iol_plazo_for(venue):
     return 't0' if venue == 'BYMA' else 't1'
 
 
+# Etapa 30 (25/08/2026): margen sobre el peor tiempo real medido para una corrida completa de
+# entradas (segundos, no minutos) más aire — protege contra un lock que quedó pegado por una
+# corrida que se colgó/crasheó a mitad de camino, sin esperar mucho para que se autolibere.
+_ENTRADAS_LOCK_TIMEOUT_MIN = 3
+
+
 def _run_motor_entradas(sb, source):
+    """Wrapper con lock: sólo una corrida de entradas (cualquier `source`) puede estar activa a
+    la vez. Nace de sumar un disparo directo desde crear-prediccion-intraday (apenas termina de
+    crear predicciones) además del cron de cada 2 minutos que ya existía (que ahora queda como
+    contingencia — si el disparo directo ya hizo el trabajo, `already_traded_pred_ids` en
+    `_run_motor_entradas_inner` hace que el cron no encuentre nada para hacer). Sin este lock, si
+    las dos vías corrieran casi al mismo instante, ambas podrían leer "todavía no hay trade para
+    esta predicción" ANTES de que ninguna escribiera nada, y las dos mandar la misma orden real
+    por separado — el índice único de auto_trades (mismo commit) protege el registro final, pero
+    no evita que IOL reciba dos órdenes reales.
+
+    El lock en sí (try_acquire_entradas_lock/release_entradas_lock) es una función SQL, no una
+    cadena de filtros de supabase-py (.or_() sobre un UPDATE nunca se había usado en este
+    proyecto, y esto maneja plata real) — probada directo con SQL antes de conectarla acá: true
+    en el primer intento, false mientras sigue tomada, null (liberada) después de release."""
+    got_lock = sb.rpc('try_acquire_entradas_lock', {'p_timeout_min': _ENTRADAS_LOCK_TIMEOUT_MIN}).execute().data
+    if not got_lock:
+        return {'ok': True, 'skipped': 'ya_corriendo'}
+    try:
+        return _run_motor_entradas_inner(sb, source)
+    finally:
+        sb.rpc('release_entradas_lock', {}).execute()
+
+
+def _run_motor_entradas_inner(sb, source):
     """source: 'intraday' (todos los horizontes) | 'daily' (sólo h=1). Evalúa predicciones
     abiertas nuevas contra costo + gate estadístico + riesgo, y abre `auto_trades` en papel donde
     corresponda. No abre nada si el kill switch está prendido, no hay portfolio para la moneda, o
@@ -3291,18 +3321,31 @@ def _run_motor_entradas(sb, source):
 
         stop_loss_usado = float(p['stop_loss_pct']) if p.get('stop_loss_pct') is not None else DEFAULT_STOP_LOSS_PCT
 
-        sb.from_('auto_trades').insert({
-            'portfolio_id': pf['id'], 'asset_id': p['asset_id'], 'prediction_type': source,
-            'daily_prediction_id': pred_id if source == 'daily' else None,
-            'intraday_prediction_id': pred_id if source == 'intraday' else None,
-            'direction': 'up', 'venue': venue, 'modo': modo,
-            'horizon_value': horizon_value, 'horizon_unit': horizon_unit,
-            'bolsa_estado_al_entrar': estado, 'bolsa_expectancy_net_at_entry': expectancy,
-            'monto_invertido': monto_invertido, 'cantidad': cantidad,
-            'stop_loss_sugerido_pct': p.get('stop_loss_pct'), 'stop_loss_usado_pct': stop_loss_usado,
-            'take_profit_pct': None, 'entry_price': entry_price,
-            'iol_buy_order_id': iol_buy_order_id,
-        }).execute()
+        try:
+            sb.from_('auto_trades').insert({
+                'portfolio_id': pf['id'], 'asset_id': p['asset_id'], 'prediction_type': source,
+                'daily_prediction_id': pred_id if source == 'daily' else None,
+                'intraday_prediction_id': pred_id if source == 'intraday' else None,
+                'direction': 'up', 'venue': venue, 'modo': modo,
+                'horizon_value': horizon_value, 'horizon_unit': horizon_unit,
+                'bolsa_estado_al_entrar': estado, 'bolsa_expectancy_net_at_entry': expectancy,
+                'monto_invertido': monto_invertido, 'cantidad': cantidad,
+                'stop_loss_sugerido_pct': p.get('stop_loss_pct'), 'stop_loss_usado_pct': stop_loss_usado,
+                'take_profit_pct': None, 'entry_price': entry_price,
+                'iol_buy_order_id': iol_buy_order_id,
+            }).execute()
+        except Exception as e:
+            # Etapa 30 (25/08/2026): defensa en profundidad — el lock de _run_motor_entradas ya
+            # debería prevenir dos corridas compitiendo por la misma predicción, pero si de
+            # todos modos pasara, el índice único auto_trades_*_prediction_id_uniq (mismo commit)
+            # hace que sólo una corrida gane el INSERT; la otra cae acá. No se re-lanza porque
+            # para 'vivo' la orden real ya se mandó — lo peor que puede pasar es no verla
+            # registrada, no que el proceso entero se caiga. Log fuerte porque, si esto pasa de
+            # verdad, hay una posición real sin trackear y hay que revisarla a mano.
+            print(f'[motor_ejecucion] {asset["ticker"]}: insert de auto_trades falló (modo={modo}, '
+                  f'{"ORDEN REAL YA COLOCADA, revisar a mano" if modo == "vivo" else "sólo papel"}): {e}',
+                  flush=True)
+            continue
         opened += 1
         if modo == 'vivo':
             slots_left_vivo -= 1
