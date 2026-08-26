@@ -3050,6 +3050,10 @@ def _iol_estado_operacion(numero):
     return _iol_request('GET', f'/api/v2/operaciones/{numero}')
 
 
+def _iol_cancelar_operacion(numero):
+    return _iol_request('DELETE', f'/api/v2/operaciones/{numero}')
+
+
 def _iol_plazo_for(venue):
     """t0 (Contado Inmediato) vale en BCBA; NASDAQ/NYSE lo rechaza (probado con la cuenta real,
     AAPL) — requiere t1. No bloquea operar la misma posición el mismo día, es sólo cuándo liquida
@@ -3123,7 +3127,7 @@ def _run_motor_entradas_inner(sb, source):
     since_cutoff = (datetime.utcnow() - timedelta(days=3)).isoformat()
     all_trades = sb.from_('auto_trades').select(
         'id, portfolio_id, status, closed_at, pnl_monto, daily_prediction_id, intraday_prediction_id, '
-        'modo, prediction_type, monto_invertido, venue'
+        'modo, prediction_type, monto_invertido, venue, asset_id, iol_buy_order_id'
     ).gte('opened_at', since_cutoff).execute().data or []
     open_trades = [t for t in all_trades if t['status'] == 'abierta']
     already_traded_pred_ids = (
@@ -3147,13 +3151,23 @@ def _run_motor_entradas_inner(sb, source):
     # (hoy deshabilitado, `live_enabled_us=false`) es un solo pool sin sub-repartir por horizonte —
     # no hace falta esa finura mientras el capital ahí sea tan chico, y así queda listo para
     # activarse solo el día que haya más dólares, sin volver a tocar este código.
+    # Etapa 30 (26/08/2026, bug real encontrado en producción, el más grave de la sesión): esta
+    # cuenta sumaba `monto_invertido` de CUALQUIER fila 'vivo'+'abierta', sin chequear si detrás
+    # había una orden real -- una fila fantasma (BBAR.BA, `_iol_comprar` nunca generó ninguna orden
+    # real, `iol_buy_order_id` null) quedó contando AR$7.925 de "capital comprometido" durante más
+    # de 4 horas, el 79% del tope de AR$10.000 intradiario, dejando sin presupuesto real a todo lo
+    # demás (`vivo_monto_insuficiente` bloqueando 44-48 candidatos por ciclo). Confirmado
+    # reconstruyendo la aritmética exacta contra la cuenta real. Ahora sólo cuenta filas con una
+    # orden real detrás -- una compra pendiente sin confirmar SÍ sigue contando (la plata está
+    # reservada de verdad en IOL), sólo se excluye la que nunca llegó a existir como orden.
     live_committed_byma_this_source = sum(
         float(t['monto_invertido']) for t in open_trades
         if t.get('modo') == 'vivo' and t.get('venue') == 'BYMA' and t.get('prediction_type') == source
+        and t.get('iol_buy_order_id')
     )
     live_committed_us = sum(
         float(t['monto_invertido']) for t in open_trades
-        if t.get('modo') == 'vivo' and t.get('venue') == 'US'
+        if t.get('modo') == 'vivo' and t.get('venue') == 'US' and t.get('iol_buy_order_id')
     )
     live_capital_cap_by_venue = {
         'BYMA': float(cfg.get('live_capital_intraday_ars' if source == 'intraday' else 'live_capital_daily_ars', 0)),
@@ -3580,8 +3594,39 @@ def _run_motor_salidas(sb):
                       f'@ {exit_price} ({close_status}) — orden {iol_sell_order_id}, se confirma el '
                       f'próximo ciclo antes de cerrar', flush=True)
             except Exception as e:
-                print(f'[motor_ejecucion] VIVO: venta real de trade {t["id"]} fallo: {e} '
-                      f'— queda abierta, se reintenta', flush=True)
+                # Etapa 30 (26/08/2026, bug real encontrado en producción, IOL MS-ORD-0016): IOL
+                # rechaza una orden nueva sobre un símbolo que ya tiene otra orden pendiente del
+                # lado opuesto ("No está permitido cargar una orden de un título teniendo una orden
+                # pendiente del side opuesto") -- confirmado real: la venta de 44 COME.BA quedó
+                # rechazada varios ciclos porque entradas había abierto una compra nueva de 5
+                # COME.BA mientras tanto (validate_order contra la cuenta real reprodujo el mismo
+                # rechazo). Tener compra y venta abiertas del mismo símbolo a la vez no tiene nada
+                # de malo -- es una restricción real de IOL que hay que resolver, no una situación a
+                # evitar de entrada. La salida gana siempre: si el rechazo es por esto, se cancela
+                # la compra rival (todavía sin confirmar) para destrabar la venta -- se reintenta
+                # recién el próximo ciclo, no en la misma corrida.
+                if 'side opuesto' in str(e) or 'MS-ORD-0016' in str(e):
+                    rival = next((r for r in open_trades if r['id'] != t['id']
+                                  and r.get('asset_id') == t['asset_id']
+                                  and r.get('modo') == 'vivo' and r.get('iol_buy_order_id')), None)
+                    if rival:
+                        try:
+                            _iol_cancelar_operacion(rival['iol_buy_order_id'])
+                            sb.from_('auto_trades').update({
+                                'status': 'cerrada_sin_ejecutar', 'closed_at': datetime.utcnow().isoformat(),
+                            }).eq('id', rival['id']).execute()
+                            print(f'[motor_ejecucion] VIVO: cancelada compra rival '
+                                  f'{rival["iol_buy_order_id"]} (trade {rival["id"]}) para destrabar '
+                                  f'la venta de {t["id"]} -- se reintenta el próximo ciclo', flush=True)
+                        except Exception as e2:
+                            print(f'[motor_ejecucion] VIVO: no se pudo cancelar la compra rival '
+                                  f'{rival.get("iol_buy_order_id")}: {e2}', flush=True)
+                    else:
+                        print(f'[motor_ejecucion] VIVO: venta de trade {t["id"]} rechazada por '
+                              f'orden opuesta pendiente pero no se encontró la fila rival', flush=True)
+                else:
+                    print(f'[motor_ejecucion] VIVO: venta real de trade {t["id"]} fallo: {e} '
+                          f'— queda abierta, se reintenta', flush=True)
             continue
 
         costo_pct = _auto_costo_pct(t['venue'], is_intraday=(t['prediction_type'] == 'intraday')) or 0.0
