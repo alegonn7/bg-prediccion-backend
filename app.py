@@ -2260,10 +2260,16 @@ _lgbm_cluster_cache_ts: float = 0.0
 # intervalo del cron (15 min) con margen, si no el progreso incremental nunca sobrevive de una
 # corrida a la siguiente.
 _LGBM_CACHE_TTL = 1800
-# Tope de cuántos tickers NUEVOS se deserializan por request — acota el costo de una sola
-# llamada para que no vuelva a matar el worker, sin bloquear la predicción (ver fallback
+# Tope de cuántos tickers (o clusters) NUEVOS se deserializan por request — acota el costo de una
+# sola llamada para que no vuelva a matar el worker, sin bloquear la predicción (ver fallback
 # ticker > cluster > sesión > global en _predict_lgbm_one, siempre devuelve algo).
-_LGBM_MAX_NEW_TICKERS_PER_CALL = 15
+# Etapa 30 (26/08/2026): bajado de 15 a 8 -- confirmado en logs reales de Render que 15 seguía
+# muriendo (SIGKILL) casi todas las corridas de hoy, incluso con el TTL de 30 min ya en su lugar
+# -- cada crash reinicia el worker y borra el caché en memoria, así que la corrida siguiente
+# vuelve a arrancar en frío de cualquier forma. Con menos por llamada, calentar el universo
+# completo (~78 activos) tarda más corridas, pero cada corrida individual tiene menos chance de
+# ser la que tira el worker.
+_LGBM_MAX_NEW_TICKERS_PER_CALL = 8
 
 
 def _enrich_indicators(ind: dict) -> dict:
@@ -2283,14 +2289,18 @@ def _lgbm_predict(m, X: 'np.ndarray') -> float:
     return float(m.predict(X[:, :n])[0])
 
 
-def _load_lgbm_models_cached():
+def _load_lgbm_models_cached(sb=None):
     """Returns dict[key] = (model, beta_spy). beta_spy=0 for old models without it.
-    Deduplicates by horizon: all model_names sharing a horizon reuse the same object."""
+    Deduplicates by horizon: all model_names sharing a horizon reuse the same object.
+    `sb`: cliente Supabase ya creado, opcional -- ver comentario largo sobre el incidente de
+    /api/predict_lgbm_batch más abajo (comparte uno solo entre las 4 funciones de este bloque en
+    vez de crear uno nuevo -- con setup de SSL/pool -- por cada una en la misma request)."""
     global _lgbm_cache, _lgbm_cache_ts
     if time.time() - _lgbm_cache_ts < 600 and _lgbm_cache:
         return _lgbm_cache
-    from supabase import create_client
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    if sb is None:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     resp = sb.table('model_learned_params_intraday').select(
         'model_name,horizon_minutes,lgbm_model,beta_spy'
     ).execute()
@@ -2364,7 +2374,7 @@ def _load_lgbm_models_cached():
 # `select model_name, count(*) from model_predictions_intraday where created_at > now() -
 # interval '1 day' group by 1` que `lgbm` deja de estar en 0.
 
-def _load_lgbm_session_models_cached(sessions: set | None = None):
+def _load_lgbm_session_models_cached(sessions: set | None = None, sb=None):
     """Per-session LGBM models. Keys: 'model_name:horizon:session'. Values: (model, beta_spy)."""
     global _lgbm_session_cache, _lgbm_session_cache_ts
     if time.time() - _lgbm_session_cache_ts > _LGBM_CACHE_TTL:
@@ -2376,8 +2386,9 @@ def _load_lgbm_session_models_cached(sessions: set | None = None):
             return _lgbm_session_cache
     else:
         missing = None
-    from supabase import create_client
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    if sb is None:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     q = sb.table('lgbm_session_models_intraday').select(
         'model_name,horizon_minutes,market_session,lgbm_model,beta_spy'
     )
@@ -2397,7 +2408,7 @@ def _load_lgbm_session_models_cached(sessions: set | None = None):
     return _lgbm_session_cache
 
 
-def _load_lgbm_ticker_models_cached(tickers: set | None = None):
+def _load_lgbm_ticker_models_cached(tickers: set | None = None, sb=None):
     """Per-ticker LGBM models. Keys: 'TICKER:horizon'. Values: (model, beta_spy, train_samples)."""
     global _lgbm_ticker_cache, _lgbm_ticker_cache_ts
     if time.time() - _lgbm_ticker_cache_ts > _LGBM_CACHE_TTL:
@@ -2414,8 +2425,9 @@ def _load_lgbm_ticker_models_cached(tickers: set | None = None):
         missing = missing[:_LGBM_MAX_NEW_TICKERS_PER_CALL]
     else:
         missing = None
-    from supabase import create_client
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    if sb is None:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     q = sb.table('lgbm_ticker_models_intraday').select(
         'ticker,horizon_minutes,lgbm_model,beta_spy,train_samples'
     )
@@ -2440,7 +2452,7 @@ def _load_lgbm_ticker_models_cached(tickers: set | None = None):
     return _lgbm_ticker_cache
 
 
-def _load_lgbm_cluster_models_cached(clusters: set | None = None):
+def _load_lgbm_cluster_models_cached(clusters: set | None = None, sb=None):
     """Per-cluster LGBM models. Keys: 'cluster_name:horizon'. Values: (model, beta_spy)."""
     global _lgbm_cluster_cache, _lgbm_cluster_cache_ts
     if time.time() - _lgbm_cluster_cache_ts > _LGBM_CACHE_TTL:
@@ -2450,10 +2462,17 @@ def _load_lgbm_cluster_models_cached(clusters: set | None = None):
         missing = sorted(set(clusters) - have)
         if not missing:
             return _lgbm_cluster_cache
+        # Etapa 30 (26/08/2026): a diferencia de tickers, esto no tenía ningún tope -- confirmado
+        # en logs reales de Render que el worker muere (SIGKILL, probable OOM en el free tier) a
+        # los pocos segundos de estas cargas en frío, mismo patrón que el incidente de tickers ya
+        # documentado arriba (Etapa 29.3-fix/fix2). Mismo tratamiento: acotar esta request, el
+        # resto se cachea en las próximas corridas (TTL de 30 min, más que el cron de 15).
+        missing = missing[:_LGBM_MAX_NEW_TICKERS_PER_CALL]
     else:
         missing = None
-    from supabase import create_client
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+    if sb is None:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
     q = sb.table('lgbm_cluster_models_intraday').select(
         'cluster_name,horizon_minutes,lgbm_model,beta_spy'
     )
@@ -2773,7 +2792,16 @@ def predict_lgbm_batch():
     if len(assets) > 200:
         return jsonify({'ok': False, 'error': 'too many assets (max 200)'}), 400
     try:
-        models = _load_lgbm_models_cached()
+        # Etapa 30 (26/08/2026): un solo cliente Supabase para las 4 cargas de acá abajo, en vez
+        # de uno nuevo por función (cada `create_client` monta su propio pool HTTP + contexto SSL
+        # -- confirmado en logs reales de Render que el worker murió (SIGKILL) en pleno setup de
+        # SSL de UNA de esas creaciones redundantes, no en ningún trabajo pesado real). Mismo
+        # incidente que motivó los fixes de caché de más arriba (Etapa 29.3-fix/fix2) -- esto es
+        # un aporte más al mismo problema, no algo nuevo.
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        models = _load_lgbm_models_cached(sb)
         if not models:
             return jsonify({'ok': True, 'results': {}, 'failed': {}, 'models_loaded': 0})
 
@@ -2791,9 +2819,9 @@ def predict_lgbm_batch():
             if c:
                 needed_clusters.add(c)
 
-        session_models = _load_lgbm_session_models_cached(needed_sessions)
-        ticker_models = _load_lgbm_ticker_models_cached(needed_tickers)
-        cluster_models = _load_lgbm_cluster_models_cached(needed_clusters)
+        session_models = _load_lgbm_session_models_cached(needed_sessions, sb)
+        ticker_models = _load_lgbm_ticker_models_cached(needed_tickers, sb)
+        cluster_models = _load_lgbm_cluster_models_cached(needed_clusters, sb)
 
         results, failed = {}, {}
         for a in assets:
