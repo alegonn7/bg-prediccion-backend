@@ -3629,6 +3629,15 @@ def _run_motor_salidas(sb):
                           f'— queda abierta, se reintenta', flush=True)
             continue
 
+        # Etapa 30 (26/08/2026, bug real encontrado en producción, introducido por el fix de arriba
+        # en esta misma sesión): de acá para abajo sólo llegan trades PAPEL -- todo trade 'vivo'
+        # hace `continue` antes, más arriba. `iol_sell_order_id` nunca se asigna para un papel
+        # (nunca hay una orden real), así que referenciarlo acá tiraba
+        # `UnboundLocalError: cannot access local variable 'iol_sell_order_id'` y crasheaba la
+        # función ENTERA con 500 en cuanto un papel llegaba a cerrarse -- confirmado real en los
+        # logs de Render, viniendo fallando desde el primer deploy de hoy. Eso frenó también la
+        # confirmación de ventas vivo (nunca se llegaba a re-evaluar nada después del papel que
+        # crasheaba), incluida la venta de las 44 COME.BA que el usuario estaba esperando.
         costo_pct = _auto_costo_pct(t['venue'], is_intraday=(t['prediction_type'] == 'intraday')) or 0.0
         gross_pct = (exit_price - entry_price) / entry_price * 100.0
         pnl_pct = gross_pct - costo_pct
@@ -3638,7 +3647,6 @@ def _run_motor_salidas(sb):
             'status': close_status, 'exit_price': exit_price,
             'pnl_pct': pnl_pct, 'pnl_monto': pnl_monto,
             'closed_at': datetime.utcnow().isoformat(),
-            'iol_sell_order_id': iol_sell_order_id,
         }).eq('id', t['id']).execute()
         closed += 1
 
