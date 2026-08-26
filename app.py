@@ -3435,7 +3435,16 @@ def _run_motor_entradas_inner(sb, source):
                     live_errors.append(f'{asset["ticker"]} ({mercado}) x{cantidad}: {str(e)[:200]}')
                 continue
         else:
-            monto_invertido = float(pf['capital_inicial']) * float(cfg.get('max_position_pct_capital', 2)) / 100.0 * conf_mult
+            # Etapa 30 (26/08/2026, a pedido explícito del usuario): `monto_base_operacion`, si
+            # está seteado, es el monto directo que usa cada operación en papel (a confianza
+            # promedio) -- independiente de `capital_inicial`, que el usuario quiere que se
+            # mantenga fijo (representa el capital total simulado, no una perilla de ajuste). Si es
+            # null, sigue el comportamiento de siempre (capital_inicial × % por posición).
+            monto_base = pf.get('monto_base_operacion')
+            if monto_base is not None:
+                monto_invertido = float(monto_base) * conf_mult
+            else:
+                monto_invertido = float(pf['capital_inicial']) * float(cfg.get('max_position_pct_capital', 2)) / 100.0 * conf_mult
             cantidad = monto_invertido / entry_price
 
         stop_loss_usado = float(p['stop_loss_pct']) if p.get('stop_loss_pct') is not None else DEFAULT_STOP_LOSS_PCT
