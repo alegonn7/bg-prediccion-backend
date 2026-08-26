@@ -2935,7 +2935,31 @@ def _iol_request(method, path, **kwargs):
     # viejo se borraron a mano (25/08/2026) — no son reales, no había ninguna operación detrás.
     if not resp.text:
         raise Exception(f'{resp.status_code} {resp.reason_phrase}: respuesta vacía (sin body) — no se puede confirmar la orden')
-    return resp.json()
+    data = resp.json()
+    # Etapa 30 (26/08/2026, bug real encontrado en producción, causa raíz de TXAR.BA/BBAR.BA —
+    # confirmado en los logs reales de Render): IOL puede rechazar una orden con HTTP 200 y el
+    # rechazo sólo en el body -- `{"ok": false, "messages": [{"description": "Los decimales
+    # indicados no son compatibles con la alteración mínima permitida"}]}` para TXAR.BA (2 acciones
+    # a $693,5 -- el tick size mínimo de esa especie no acepta ese precio con esos decimales). El
+    # código sólo miraba el status HTTP, nunca `ok`, así que esto se trataba como éxito -- sin
+    # `numeroOperacion` reconocido, pero igual insertado como `modo='vivo'` con plata fantasma
+    # contando contra el capital real (ver el fix de `live_committed_*` más abajo en el archivo).
+    # Un `{"ok": false, ...}` con 200 ahora es un error real, igual que un 4xx.
+    if isinstance(data, dict) and data.get('ok') is False:
+        mensajes = '; '.join(
+            str(m.get('description') or m.get('title') or m) if isinstance(m, dict) else str(m)
+            for m in (data.get('messages') or [])) or str(data)
+        raise Exception(f'{resp.status_code} rechazado por IOL (ok=false): {mensajes[:400]}')
+    # Etapa 30 (26/08/2026, bug real encontrado en producción): otro rechazo de IOL (al intentar
+    # vender TXAR.BA/BBAR.BA, posiciones fantasma sin acciones reales detrás) vino como una LISTA
+    # JSON en la raíz en vez de un objeto -- el código que sigue siempre espera un dict y llama
+    # `.get(...)` sobre la respuesta, lo que tiraba `'list' object has no attribute 'get'` (atrapado
+    # por el except de más arriba, no rompía nada, pero tampoco daba ninguna pista real del motivo).
+    # Ninguna respuesta de éxito real de comprar/vender/estado de operación es una lista -- tratarla
+    # como error igual, con el contenido crudo en el mensaje para poder diagnosticar de verdad.
+    if isinstance(data, list):
+        raise Exception(f'{resp.status_code} rechazado por IOL (respuesta lista, no objeto): {str(data)[:400]}')
+    return data
 
 
 def _iol_estado_cuenta():
