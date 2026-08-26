@@ -3288,12 +3288,13 @@ def _run_motor_entradas_inner(sb, source):
         stale_cutoff = (datetime.utcnow() - timedelta(minutes=20)).isoformat()
         preds = sb.from_('consensus_predictions_intraday').select(
             'id, asset_id, direction, horizon_minutes, status, price_at_creation, final_pct_predicted, '
-            'stop_loss_pct, target_time'
+            'stop_loss_pct, target_time, confidence'
         ).eq('status', 'open').eq('direction', 'up').gte('created_at', stale_cutoff).execute().data or []
         horizon_unit = 'minutes'
     else:
         preds = sb.from_('consensus_predictions').select(
-            'id, asset_id, direction, horizon_days, status, price_at_creation, final_pct_predicted, stop_loss_pct'
+            'id, asset_id, direction, horizon_days, status, price_at_creation, final_pct_predicted, '
+            'stop_loss_pct, confidence'
         ).eq('status', 'open').eq('direction', 'up').eq('horizon_days', 1).execute().data or []
         horizon_unit = 'days'
 
@@ -3354,6 +3355,19 @@ def _run_motor_entradas_inner(sb, source):
             skipped_reasons['sin_precio'] += 1
             continue
 
+        # Etapa 30 (26/08/2026, a pedido explícito del usuario): tamaño de posición ponderado por
+        # confianza -- hasta ahora tanto papel (siempre el mismo % fijo de capital_inicial) como
+        # vivo (siempre el mismo % fijo del presupuesto disponible) usaban el mismo tamaño sin
+        # importar qué tan confiable fuera la predicción puntual -- desperdiciando capital en
+        # apuestas dudosas y dejando plata sobre la mesa en las mejores. `confidence` (0-1, ya
+        # calculado por el consenso de modelos, nunca usado hasta hoy para esto) multiplica la base
+        # de siempre -- confidence=0.5 (promedio real observado en la práctica) da 1x, igual que el
+        # comportamiento de antes; más alto la escala hasta 2x, más bajo la achica hasta 0.5x. En
+        # vivo, el resultado igual nunca supera `budget` (el techo real de plata disponible) —
+        # confianza más alta reparte MEJOR ese mismo techo, no lo agranda.
+        confidence = p.get('confidence')
+        conf_mult = 1.0 if confidence is None else max(0.5, min(2.0, float(confidence) / 0.5))
+
         # Etapa 30 (continuación): modo vivo, habilitado por venue (live_enabled_byma/_us). Usa
         # efectivo REAL (estado de cuenta de IOL en el momento, no el capital_inicial de papel) y
         # coloca una orden de compra real. Si algo falla (auth, DDJJ requerido, fondos
@@ -3390,7 +3404,7 @@ def _run_motor_entradas_inner(sb, source):
             # tope asignado a Argentina/EEUU, aunque sobre efectivo real de la otra moneda.
             remaining_allocation = max(0.0, live_capital_cap_by_venue.get(venue, 0.0) - live_committed_by_venue[venue])
             budget = min(remaining_allocation, cash)
-            monto_invertido = budget * float(cfg.get('live_position_pct', 90)) / 100.0
+            monto_invertido = min(budget * float(cfg.get('live_position_pct', 90)) / 100.0 * conf_mult, budget)
             cantidad = int(monto_invertido / entry_price)  # unidades enteras — IOL no fracciona acciones/CEDEARs
             if cantidad < 1:
                 skipped_reasons['vivo_monto_insuficiente'] += 1
@@ -3421,7 +3435,7 @@ def _run_motor_entradas_inner(sb, source):
                     live_errors.append(f'{asset["ticker"]} ({mercado}) x{cantidad}: {str(e)[:200]}')
                 continue
         else:
-            monto_invertido = float(pf['capital_inicial']) * float(cfg.get('max_position_pct_capital', 2)) / 100.0
+            monto_invertido = float(pf['capital_inicial']) * float(cfg.get('max_position_pct_capital', 2)) / 100.0 * conf_mult
             cantidad = monto_invertido / entry_price
 
         stop_loss_usado = float(p['stop_loss_pct']) if p.get('stop_loss_pct') is not None else DEFAULT_STOP_LOSS_PCT
