@@ -3747,6 +3747,33 @@ def _run_motor_salidas_inner(sb):
     return {'ok': True, 'closed': closed, 'evaluated': len(open_trades)}
 
 
+@app.route('/api/refresh_cash', methods=['POST', 'OPTIONS'])
+def refresh_cash():
+    """Etapa 30 (26/08/2026, a pedido explícito del usuario): actualiza last_known_ars_cash/
+    last_known_usd_cash al toque contra IOL, sin correr ninguna lógica de entradas/salidas -- para
+    el botón "actualizar ahora" del panel de plata real del dashboard. Antes sólo se refrescaba
+    como efecto secundario de una corrida completa de entradas (hasta ~15 min de atraso), que
+    además evalúa/abre posiciones reales -- no algo que un botón de "sólo mostrame el número
+    actual" deba disparar de rebote."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not _check_secret():
+        return jsonify({'ok': False, 'error': 'forbidden'}), 403
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        ars, usd = _iol_available_cash_both()
+        update = {'last_known_cash_at': datetime.utcnow().isoformat()}
+        if ars is not None:
+            update['last_known_ars_cash'] = ars
+        if usd is not None:
+            update['last_known_usd_cash'] = usd
+        sb.from_('auto_trading_config').update(update).eq('id', True).execute()
+        return jsonify({'ok': True, 'last_known_ars_cash': ars, 'last_known_usd_cash': usd})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
 @app.route('/api/motor_ejecucion', methods=['POST', 'OPTIONS'])
 def motor_ejecucion():
     """Etapa 30 — motor de trading automático (hoy sólo papel, ver REDISENO/ETAPA-30). Disparado
