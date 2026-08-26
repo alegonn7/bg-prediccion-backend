@@ -3742,22 +3742,6 @@ def iol_test():
         return jsonify({'ok': False, 'auth': 'failed', 'error': str(e)}), 500
 
 
-@app.route('/api/iol_test_operacion', methods=['GET'])
-def iol_test_operacion():
-    """Diagnóstico TEMPORAL (26/08/2026) — sacar después de confirmar el shape real de
-    /api/v2/operaciones/{numero}. Sólo lectura, no opera nada."""
-    if not _check_secret():
-        return jsonify({'ok': False, 'error': 'forbidden'}), 403
-    numero = request.args.get('numero')
-    if not numero:
-        return jsonify({'ok': False, 'error': 'falta ?numero='}), 400
-    try:
-        raw = _iol_estado_operacion(int(numero))
-        return jsonify({'ok': True, 'raw': raw})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-
 # ── APScheduler: auto-train daily at 21:30 UTC ────────────────────────────────
 
 def _keep_alive_loop(stop_event: threading.Event):
