@@ -3038,6 +3038,18 @@ def _iol_vender(mercado, simbolo, precio, cantidad, plazo='t0'):
     })
 
 
+def _iol_estado_operacion(numero):
+    """Estado real de una orden ya enviada. Etapa 30 (26/08/2026, bug real en producción,
+    confirmado contra la cuenta real vía MCP get_order_status): `_iol_vender`/`_iol_comprar`
+    devuelven éxito HTTP en cuanto IOL ACEPTA la orden límite, no cuando se ejecuta -- una venta
+    real de COME.BA quedó con `current_status: "en proceso"` y `executions: [{"quantity": 0}]`
+    (cero acciones vendidas) mientras `_run_motor_salidas` ya la había marcado 'cerrada_normal'
+    igual, dejando una posición real sin ningún control de stop-loss por horas. Ver
+    `_run_motor_salidas`: ahora no confía en el HTTP de `_iol_vender`, confirma acá antes de tocar
+    el status de la fila."""
+    return _iol_request('GET', f'/api/v2/operaciones/{numero}')
+
+
 def _iol_plazo_for(venue):
     """t0 (Contado Inmediato) vale en BCBA; NASDAQ/NYSE lo rechaza (probado con la cuenta real,
     AAPL) — requiere t1. No bloquea operar la misma posición el mismo día, es sólo cuándo liquida
@@ -3190,9 +3202,23 @@ def _run_motor_entradas_inner(sb, source):
         sb.from_('assets').select('id, ticker, currency, core_bucket, exchange').execute().data or [])}
 
     if source == 'intraday':
+        # Etapa 30 (26/08/2026, bug real encontrado en producción): esta consulta no tenía ningún
+        # filtro de antigüedad -- sólo `status='open'` (que sólo lo cierra el cron aparte de
+        # juez-intraday, cada 5 min). Confirmado real: cuando Render se cayó unas horas (WORKER
+        # TIMEOUT/SIGKILL, visto en los logs pegados hoy), 3 predicciones de hace 3-4 horas seguían
+        # 'open' y se actuaron todas juntas cuando el motor volvió a correr, usando su
+        # `price_at_creation` de hace horas como si fuera el precio actual -- una de ellas (TXAR.BA)
+        # se compró 2 minutos DESPUÉS de que su propio horizonte de 240min ya había vencido. El
+        # buffer de precio (`_ORDEN_PRECIO_BUFFER_PCT`) está calibrado para una predicción de
+        # segundos/minutos, no de horas -- no es el problema, la predicción vieja sí. Se descarta
+        # cualquier predicción de más de 20 min (algo más que un ciclo completo de
+        # intraday-prediccion-15min, con aire para que la contingencia atrape una demora corta sin
+        # rechazar de más).
+        stale_cutoff = (datetime.utcnow() - timedelta(minutes=20)).isoformat()
         preds = sb.from_('consensus_predictions_intraday').select(
-            'id, asset_id, direction, horizon_minutes, status, price_at_creation, final_pct_predicted, stop_loss_pct'
-        ).eq('status', 'open').eq('direction', 'up').execute().data or []
+            'id, asset_id, direction, horizon_minutes, status, price_at_creation, final_pct_predicted, '
+            'stop_loss_pct, target_time'
+        ).eq('status', 'open').eq('direction', 'up').gte('created_at', stale_cutoff).execute().data or []
         horizon_unit = 'minutes'
     else:
         preds = sb.from_('consensus_predictions').select(
@@ -3207,6 +3233,14 @@ def _run_motor_entradas_inner(sb, source):
         pred_id = p['id']
         if pred_id in already_traded_pred_ids:
             continue
+        # Etapa 30 (26/08/2026): defensa en profundidad además del corte de 20 min de arriba --
+        # un horizonte corto (ej. 15min) creado hace 18 min ya venció aunque pase ese corte. Nunca
+        # tiene sentido abrir una posición cuyo horizonte de salida ya terminó.
+        if source == 'intraday' and p.get('target_time'):
+            target_time = datetime.fromisoformat(p['target_time'].replace('Z', '+00:00')).replace(tzinfo=None)
+            if datetime.utcnow() >= target_time:
+                skipped_reasons['prediccion_vencida'] += 1
+                continue
         asset = assets_by_id.get(p['asset_id'])
         if not asset:
             skipped_reasons['sin_asset'] += 1
@@ -3395,7 +3429,8 @@ def _run_motor_salidas(sb):
     filtro de costo: la magnitud bruta no es el número que importa)."""
     open_trades = sb.from_('auto_trades').select(
         'id, asset_id, venue, modo, prediction_type, daily_prediction_id, intraday_prediction_id, '
-        'entry_price, cantidad, monto_invertido, stop_loss_usado_pct, take_profit_pct'
+        'entry_price, cantidad, monto_invertido, stop_loss_usado_pct, take_profit_pct, '
+        'iol_buy_order_id, iol_sell_order_id'
     ).eq('status', 'abierta').execute().data or []
     if not open_trades:
         return {'ok': True, 'closed': 0}
@@ -3425,6 +3460,77 @@ def _run_motor_salidas(sb):
         current_price = latest_prices.get(t['asset_id'])
         gross_pct_now = ((current_price - entry_price) / entry_price * 100.0) if current_price else None
 
+        # Etapa 30 (26/08/2026): si esta fila 'vivo' ya tiene una venta real en curso de un ciclo
+        # anterior (`iol_sell_order_id` seteado, pero `status` sigue 'abierta' -- recién se marca
+        # cerrada más abajo cuando esto confirma el fill), no se reevalúan condiciones de salida ni
+        # se manda una segunda orden encima de la primera. Sólo se confirma contra IOL si esa venta
+        # ya se ejecutó de verdad.
+        if t.get('modo') == 'vivo' and t.get('iol_sell_order_id'):
+            try:
+                op = _iol_estado_operacion(t['iol_sell_order_id'])
+                ejecuciones = op.get('executions') or []
+                cantidad_total = float(t['cantidad'] or 0)
+                cantidad_ejecutada = sum(float(e.get('quantity') or 0) for e in ejecuciones)
+                if cantidad_ejecutada < cantidad_total - 0.0001:
+                    print(f'[motor_ejecucion] VIVO: venta de trade {t["id"]} (orden '
+                          f'{t["iol_sell_order_id"]}) todavía no se ejecutó ({cantidad_ejecutada}/'
+                          f'{cantidad_total}) -- se deja abierta, se reconfirma el próximo ciclo', flush=True)
+                    continue
+                valor_total = sum(float(e.get('quantity') or 0) * float(e.get('price') or 0) for e in ejecuciones)
+                exit_price = (valor_total / cantidad_ejecutada) if cantidad_ejecutada > 0 else entry_price
+                if t.get('take_profit_pct') is not None and gross_pct_now is not None and gross_pct_now >= t['take_profit_pct']:
+                    close_status = 'cerrada_por_take_profit'
+                elif gross_pct_now is not None and gross_pct_now <= t['stop_loss_usado_pct']:
+                    close_status = 'cerrada_por_stop'
+                else:
+                    close_status = 'cerrada_normal'
+                costo_pct = _auto_costo_pct(t['venue'], is_intraday=(t['prediction_type'] == 'intraday')) or 0.0
+                gross_pct = (exit_price - entry_price) / entry_price * 100.0
+                pnl_pct = gross_pct - costo_pct
+                pnl_monto = pnl_pct / 100.0 * float(t['monto_invertido'])
+                sb.from_('auto_trades').update({
+                    'status': close_status, 'exit_price': exit_price,
+                    'pnl_pct': pnl_pct, 'pnl_monto': pnl_monto,
+                    'closed_at': datetime.utcnow().isoformat(),
+                }).eq('id', t['id']).execute()
+                print(f'[motor_ejecucion] VIVO: venta de trade {t["id"]} confirmada ejecutada '
+                      f'@ {exit_price} ({close_status})', flush=True)
+                closed += 1
+            except Exception as e:
+                print(f'[motor_ejecucion] VIVO: no se pudo confirmar estado de venta real (orden '
+                      f'{t["iol_sell_order_id"]}, trade {t["id"]}): {e} -- se reintenta el próximo ciclo', flush=True)
+            continue
+
+        # Etapa 30 (26/08/2026, mismo bug encontrado del lado de compra el mismo día -- confirmado
+        # real contra la cuenta: dos compras de COME.BA, 10 y 1 acciones, quedaron "en proceso" con
+        # 0 ejecutado en IOL, pero la fila se había creado igual como si ya se hubiera comprado,
+        # sólo porque `_iol_comprar` no tiró excepción -- el portfolio real (49 acciones) no
+        # coincidía con lo que auto_trades sumaba (60). Antes de evaluar cualquier condición de
+        # salida sobre una fila 'vivo' hay que confirmar que la compra que la originó se ejecutó de
+        # verdad -- si no, no hay ninguna posición real todavía que gestionar ni que vender.
+        if t.get('modo') == 'vivo':
+            if not t.get('iol_buy_order_id'):
+                print(f'[motor_ejecucion] VIVO: trade {t["id"]} sin iol_buy_order_id -- la compra '
+                      f'real nunca se confirmó, no se gestiona (revisar a mano)', flush=True)
+                continue
+            try:
+                op = _iol_estado_operacion(t['iol_buy_order_id'])
+                ejecuciones = op.get('executions') or []
+                cantidad_total = float(t['cantidad'] or 0)
+                cantidad_ejecutada = sum(float(e.get('quantity') or 0) for e in ejecuciones)
+                if cantidad_ejecutada < cantidad_total - 0.0001:
+                    continue
+                valor_total = sum(float(e.get('quantity') or 0) * float(e.get('price') or 0) for e in ejecuciones)
+                entry_price_real = (valor_total / cantidad_ejecutada) if cantidad_ejecutada > 0 else entry_price
+                if abs(entry_price_real - entry_price) > 0.0001:
+                    sb.from_('auto_trades').update({'entry_price': entry_price_real}).eq('id', t['id']).execute()
+                    entry_price = entry_price_real
+                    gross_pct_now = ((current_price - entry_price) / entry_price * 100.0) if current_price else None
+            except Exception as e:
+                print(f'[motor_ejecucion] VIVO: no se pudo confirmar estado de compra (orden '
+                      f'{t["iol_buy_order_id"]}, trade {t["id"]}): {e} -- se reintenta el próximo ciclo', flush=True)
+                continue
+
         exit_price, close_status = None, None
         if t.get('take_profit_pct') is not None and gross_pct_now is not None and gross_pct_now >= t['take_profit_pct']:
             exit_price, close_status = current_price, 'cerrada_por_take_profit'
@@ -3450,11 +3556,13 @@ def _run_motor_salidas(sb):
         if not close_status:
             continue
 
-        # Etapa 30 (continuación): modo vivo vende de verdad antes de marcar la fila como cerrada.
-        # Si la venta real falla, la fila queda abierta (se reintenta el próximo ciclo) — nunca se
-        # marca 'cerrada' sin una orden real detrás, para que auto_trades no mienta sobre lo que
-        # pasó con la plata real.
-        iol_sell_order_id = None
+        # Etapa 30 (26/08/2026): modo vivo manda la venta real pero NO marca la fila cerrada acá --
+        # sólo guarda `iol_sell_order_id` y la deja 'abierta'. El bloque de arriba, al principio del
+        # loop, es el único que la cierra, y sólo después de confirmar contra IOL que se ejecutó de
+        # verdad (bug real encontrado hoy: una orden límite "en proceso" con 0 ejecutado se estaba
+        # marcando cerrada igual con un `exit_price`/`pnl` inventados, sólo porque el POST no tiró
+        # excepción -- una posición real de 44 acciones de COME.BA quedó sin ningún control de
+        # stop-loss por horas mientras el sistema creía que ya no tenía nada abierto ahí).
         if t.get('modo') == 'vivo':
             asset = assets_by_id.get(t['asset_id'])
             cantidad_vender = int(t['cantidad'] or 0)
@@ -3467,12 +3575,14 @@ def _run_motor_salidas(sb):
             try:
                 orden = _iol_vender(mercado, _iol_simbolo_for(asset['ticker']), exit_price, cantidad_vender, plazo=plazo)
                 iol_sell_order_id = orden.get('numeroOperacion') or orden.get('numero') or orden.get('id')
-                print(f'[motor_ejecucion] VIVO: venta real {asset["ticker"]} x{cantidad_vender} '
-                      f'@ {exit_price} ({close_status}) — orden {iol_sell_order_id}', flush=True)
+                sb.from_('auto_trades').update({'iol_sell_order_id': iol_sell_order_id}).eq('id', t['id']).execute()
+                print(f'[motor_ejecucion] VIVO: venta real enviada {asset["ticker"]} x{cantidad_vender} '
+                      f'@ {exit_price} ({close_status}) — orden {iol_sell_order_id}, se confirma el '
+                      f'próximo ciclo antes de cerrar', flush=True)
             except Exception as e:
                 print(f'[motor_ejecucion] VIVO: venta real de trade {t["id"]} fallo: {e} '
                       f'— queda abierta, se reintenta', flush=True)
-                continue
+            continue
 
         costo_pct = _auto_costo_pct(t['venue'], is_intraday=(t['prediction_type'] == 'intraday')) or 0.0
         gross_pct = (exit_price - entry_price) / entry_price * 100.0
