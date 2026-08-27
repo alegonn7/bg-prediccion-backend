@@ -4273,3 +4273,27 @@ try:
     print('[scheduler] APScheduler started — auto-training at 21:30 UTC daily', flush=True)
 except Exception as _sched_err:
     print(f'[scheduler] WARNING: could not start APScheduler: {_sched_err}', flush=True)
+
+# Fix (27/08/2026, a pedido explícito del usuario, incidente real): la primera llamada a
+# /api/predict_lgbm_batch después de un restart deserializa los modelos por cluster en frío
+# (pickle.loads sobre el blob de LightGBM) DENTRO del request -- visto real en producción hoy
+# (13:45 UTC): CRITICAL WORKER TIMEOUT + SIGKILL cargando eso, tumbando el único worker a mitad
+# de una corrida de predicciones. Precalentar acá, en un thread de fondo que arranca apenas boot-ea
+# el worker (module-level, antes de que gunicorn empiece a aceptar requests) -- así el costo de
+# la carga en frío no cuenta contra el timeout de ningún request real, pase lo que pase mientras
+# carga. Sólo los modelos por CLUSTER (un puñado fijo, ~3 según el log real -- no los modelos por
+# TICKER, que son hasta 81 y ya tienen su propio precalentado incremental y acotado por llamada,
+# ver _LGBM_MAX_NEW_TICKERS_PER_CALL; precalentarlos todos de una en el boot sería la misma clase
+# de problema que esto arregla, sólo que con memoria en vez de tiempo).
+def _warmup_lgbm_cluster_cache():
+    try:
+        _load_lgbm_cluster_models_cached(None)
+        print(f'[lgbm_warmup] precalentado ok, {len(_lgbm_cluster_cache)} claves de cluster', flush=True)
+    except Exception as e:
+        print(f'[lgbm_warmup] no se pudo precalentar (no bloquea el arranque): {e}', flush=True)
+
+
+try:
+    threading.Thread(target=_warmup_lgbm_cluster_cache, daemon=True).start()
+except Exception as _warmup_err:
+    print(f'[lgbm_warmup] WARNING: no se pudo lanzar el thread de precalentado: {_warmup_err}', flush=True)
