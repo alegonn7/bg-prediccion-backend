@@ -2853,9 +2853,19 @@ def predict_lgbm_batch():
 #
 # Comisiones IOL: mismos números que `routeInstrument()`/`DEFAULT_COSTO_CONFIG` en
 # dashboard/lib/tracking.ts (Fase A/B de la Etapa 30) — duplicado acá porque este código corre en
-# Python vía cron y no puede importar TS. Si se recalibra uno, recalibrar el otro.
+# Python vía cron y no puede importar TS. Si se recalibra uno, recalibrar el otro (y también la
+# constante `costo` de `compute_intraday_scorecard()` en Supabase — mismo número, tres lugares).
+#
+# Fix (27/08/2026, a pedido explícito del usuario, calibrado contra 2 ida-y-vuelta reales de COME.BA
+# el 26/08): 'intradia' subía de 0.67 a 0.727 -- medido con las comisiones reales de las 4 órdenes
+# (44 acciones: compra 0.6656%, venta 0.0603%, total 0.7266%; 5 acciones: compra 0.6644%, venta
+# 0.0578%, total 0.7226%). 0.67% no estaba mal por asumir 2 patas completas (esa es la lectura
+# equivocada que se hizo en esta misma sesión antes de medirlo) -- la bonificación real de IOL SÍ
+# es asimétrica (una pata paga casi todo, la otra casi nada), 0.67% sólo se quedaba corto por un
+# margen chico. 'normal' (1.33%, 2 patas completas sin bonificación) no se tocó -- la pata de
+# compra medida (0.665%) coincide con la mitad exacta de 1.33%, confirma que ese número sigue bien.
 AUTO_COSTO_PCT = {
-    'BYMA': {'normal': 1.33, 'intradia': 0.67},
+    'BYMA': {'normal': 1.33, 'intradia': 0.727},
     'US':   {'normal': 0.85, 'intradia': 0.85},
 }
 
@@ -2882,6 +2892,26 @@ def _auto_route(core_bucket):
 
 def _auto_costo_pct(venue, is_intraday):
     return AUTO_COSTO_PCT.get(venue, {}).get('intradia' if is_intraday else 'normal')
+
+
+# Fix (27/08/2026, a pedido explícito del usuario, mismo hallazgo del recalibrado de arriba): la
+# bonificación intradía de IOL exige vender "lo comprado HOY, mismo día" -- si el cierre de un
+# trade 'intraday' termina cayendo en un día distinto al de apertura (exactamente lo que pasó con
+# las 258 COME.BA de hoy: horizonte vencido, la venta no llegó a ejecutar antes del cierre, quedó
+# para el día siguiente), esa condición ya no se cumple y la pata de venta paga comisión completa
+# -- el costo real pasa a ser el de 'normal' (1.33%), el doble del 'intradia' (0.727%) que
+# _auto_costo_pct() devolvería a ciegas mirando sólo prediction_type. Antes esto no se detectaba:
+# _run_motor_salidas_inner llamaba _auto_costo_pct(venue, is_intraday=prediction_type=='intraday')
+# sin chequear si el cierre realmente pasó el mismo día, así que un trade que cruza de día por un
+# problema de ejecución (como el bug que motivó el fix del buffer de venta, ver
+# _ORDEN_PRECIO_BUFFER_VENTA_PCT) quedaba con un pnl inflado -- costo real subestimado a la mitad.
+def _auto_costo_pct_real(venue, prediction_type, opened_at_raw, cierre_dt):
+    intraday = prediction_type == 'intraday'
+    if intraday and opened_at_raw:
+        opened_dt = datetime.fromisoformat(str(opened_at_raw).replace('Z', '+00:00')).replace(tzinfo=None)
+        if opened_dt.date() != cierre_dt.date():
+            intraday = False
+    return _auto_costo_pct(venue, intraday)
 
 
 # ── Etapa 30 (continuación, 18/08/2026): cliente REST real de IOL para operar en vivo ─────────
@@ -3618,7 +3648,7 @@ def _run_motor_salidas_inner(sb):
     open_trades = sb.from_('auto_trades').select(
         'id, asset_id, venue, modo, prediction_type, daily_prediction_id, intraday_prediction_id, '
         'entry_price, cantidad, monto_invertido, stop_loss_usado_pct, take_profit_pct, '
-        'iol_buy_order_id, iol_sell_order_id'
+        'iol_buy_order_id, iol_sell_order_id, opened_at'
     ).eq('status', 'abierta').execute().data or []
     if not open_trades:
         return {'ok': True, 'closed': 0}
@@ -3712,7 +3742,7 @@ def _run_motor_salidas_inner(sb):
                     close_status = 'cerrada_por_stop'
                 else:
                     close_status = 'cerrada_normal'
-                costo_pct = _auto_costo_pct(t['venue'], is_intraday=(t['prediction_type'] == 'intraday')) or 0.0
+                costo_pct = _auto_costo_pct_real(t['venue'], t['prediction_type'], t.get('opened_at'), datetime.utcnow()) or 0.0
                 gross_pct = (exit_price - entry_price) / entry_price * 100.0
                 pnl_pct = gross_pct - costo_pct
                 pnl_monto = pnl_pct / 100.0 * float(t['monto_invertido'])
