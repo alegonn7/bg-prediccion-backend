@@ -3071,6 +3071,22 @@ def _iol_simbolo_for(ticker):
 # no hecho todavía (anotado junto al pedido de reconciliar contra el precio de ejecución real).
 _ORDEN_PRECIO_BUFFER_PCT = 0.1
 
+# Fix (27/08/2026, incidente real, a pedido explícito del usuario): la venta de 258 COME.BA por
+# vencimiento de horizonte (240min) se mandó a las 16:30hs ART con el mismo buffer de 0,1% que usa
+# la compra -- quedó "En Proceso" sin ejecutar ni un cierre de rueda entero después, todavía viva
+# como límite para el día siguiente. Un margen tan chico protege el edge en la ENTRADA (ahí sí
+# importa el precio), pero en la SALIDA el objetivo es distinto: cuando el motor decide cerrar
+# (venció el plazo, o saltó el stop-loss/take-profit) la prioridad es salir de la posición, no
+# conseguir el mejor precio -- un límite casi pegado al último precio conocido (que además puede
+# tener hasta ~10 min de atraso, ver `_get_latest_prices`) es fácil que no cruce. IOL no tiene un
+# tipo "a mercado" confiable en la práctica (ver comentario de arriba: `tipoOrden='precioMercado'`
+# devolvía HTTP éxito con body vacío y cero plata movida, probado contra la cuenta real) -- la
+# forma de simular "vender ya, al precio que sea" sin ese camino roto es un límite con margen
+# generoso sobre el precio de referencia, para que en la práctica cruce contra cualquier oferta de
+# compra razonable del momento. 2% absorbe cómodamente el atraso de ~10min de `precio` sin ser
+# "vender a cualquier precio" sin ningún piso.
+_ORDEN_PRECIO_BUFFER_VENTA_PCT = 2.0
+
 
 def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
@@ -3083,7 +3099,7 @@ def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
 
 def _iol_vender(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
-    precio_limite = round(precio * (1 - _ORDEN_PRECIO_BUFFER_PCT / 100), 2)
+    precio_limite = round(precio * (1 - _ORDEN_PRECIO_BUFFER_VENTA_PCT / 100), 2)
     return _iol_request('POST', '/api/v2/operar/Vender', json={
         'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad, 'precio': precio_limite,
         'validez': validez, 'plazo': plazo,
@@ -3595,10 +3611,42 @@ def _run_motor_salidas_inner(sb):
                 cantidad_total = float(t['cantidad'] or 0)
                 cantidad_ejecutada = sum(float(e.get('cantidad') or 0) for e in ejecuciones)
                 if cantidad_ejecutada < cantidad_total - 0.0001:
-                    print(f'[motor_ejecucion] VIVO: venta de trade {t["id"]} (orden '
-                          f'{t["iol_sell_order_id"]}) todavía no se ejecutó ({cantidad_ejecutada}/'
-                          f'{cantidad_total}) -- se deja abierta, se reconfirma el próximo ciclo', flush=True)
-                    continue
+                    # Fix (27/08/2026, incidente real: venta de 258 COME.BA quedó "En Proceso" todo
+                    # el resto de la rueda y el usuario terminó cancelándola a mano) — hasta acá,
+                    # una orden de venta sin ejecutar se reconfirmaba pasivamente cada ciclo para
+                    # siempre, sin límite: si nunca llena (o el usuario la cancela desde la app de
+                    # IOL, o IOL la rechaza tarde), la fila queda 'abierta' eternamente, con la plata
+                    # contando como comprometida contra `live_capital_intraday_ars` sin que nada la
+                    # vuelva a intentar vender. Si ya cruzamos a un día distinto del `target_time`
+                    # (el horizonte original), se abandona esa orden vieja (se cancela por las
+                    # dudas, no pasa nada si ya estaba cancelada) y se limpia `iol_sell_order_id` --
+                    # el bloque de más abajo, en el próximo ciclo, ve la fila como recién vencida
+                    # de nuevo y manda una orden NUEVA con el precio y el buffer de venta del
+                    # momento (`_ORDEN_PRECIO_BUFFER_VENTA_PCT`, agrandado hoy mismo) — no espera
+                    # más a una orden que ya no tiene forma de resolverse sola.
+                    pred_ref = (intraday_status.get(t['intraday_prediction_id'])
+                                if t.get('intraday_prediction_id') else None)
+                    target_raw = pred_ref.get('target_time') if pred_ref else None
+                    target_dt = (datetime.fromisoformat(target_raw.replace('Z', '+00:00')).replace(tzinfo=None)
+                                 if target_raw else None)
+                    if target_dt is not None and datetime.utcnow().date() > target_dt.date():
+                        try:
+                            _iol_cancelar_operacion(t['iol_sell_order_id'])
+                        except Exception as e_cancel:
+                            print(f'[motor_ejecucion] VIVO: no se pudo cancelar orden vieja '
+                                  f'{t["iol_sell_order_id"]} (puede que ya estuviera cancelada): '
+                                  f'{e_cancel}', flush=True)
+                        sb.from_('auto_trades').update({'iol_sell_order_id': None}).eq('id', t['id']).execute()
+                        print(f'[motor_ejecucion] VIVO: orden de venta vieja {t["iol_sell_order_id"]} '
+                              f'(trade {t["id"]}) abandonada -- cruzó de día sin ejecutar, el próximo '
+                              f'ciclo la va a ver como recién vencida y va a mandar una nueva a precio '
+                              f'de mercado del momento', flush=True)
+                        continue
+                    else:
+                        print(f'[motor_ejecucion] VIVO: venta de trade {t["id"]} (orden '
+                              f'{t["iol_sell_order_id"]}) todavía no se ejecutó ({cantidad_ejecutada}/'
+                              f'{cantidad_total}) -- se deja abierta, se reconfirma el próximo ciclo', flush=True)
+                        continue
                 valor_total = sum(float(e.get('cantidad') or 0) * float(e.get('precio') or 0) for e in ejecuciones)
                 exit_price = (valor_total / cantidad_ejecutada) if cantidad_ejecutada > 0 else entry_price
                 if t.get('take_profit_pct') is not None and gross_pct_now is not None and gross_pct_now >= t['take_profit_pct']:
