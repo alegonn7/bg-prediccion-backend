@@ -3066,9 +3066,10 @@ def _iol_simbolo_for(ticker):
 # que la comisión misma. Bajado a 0.1% (~15% del costo mínimo, no la mitad) — sigue dando margen
 # para que la orden límite llene sin acercarse a borrar el edge. Esto es un parche, no la solución
 # de fondo: el buffer existe para cubrir que `precio` (price_at_creation de la predicción) puede
-# estar minutos u horas desactualizado al momento real de la orden — la solución de fondo sería
-# pedir una cotización fresca justo antes de mandar la orden en vez de confiar en un precio viejo,
-# no hecho todavía (anotado junto al pedido de reconciliar contra el precio de ejecución real).
+# estar minutos u horas desactualizado al momento real de la orden — la solución de fondo, pedir
+# una cotización fresca justo antes de mandar la orden en vez de confiar en un precio viejo, se
+# implementó el 27/08/2026 (ver `_iol_precio_fresco` más abajo) — este buffer de 0,1% ahora sólo
+# se usa como red de seguridad si esa cotización fresca falla.
 _ORDEN_PRECIO_BUFFER_PCT = 0.1
 
 # Fix (27/08/2026, incidente real, a pedido explícito del usuario): la venta de 258 COME.BA por
@@ -3077,20 +3078,72 @@ _ORDEN_PRECIO_BUFFER_PCT = 0.1
 # como límite para el día siguiente. Un margen tan chico protege el edge en la ENTRADA (ahí sí
 # importa el precio), pero en la SALIDA el objetivo es distinto: cuando el motor decide cerrar
 # (venció el plazo, o saltó el stop-loss/take-profit) la prioridad es salir de la posición, no
-# conseguir el mejor precio -- un límite casi pegado al último precio conocido (que además puede
-# tener hasta ~10 min de atraso, ver `_get_latest_prices`) es fácil que no cruce. IOL no tiene un
-# tipo "a mercado" confiable en la práctica (ver comentario de arriba: `tipoOrden='precioMercado'`
-# devolvía HTTP éxito con body vacío y cero plata movida, probado contra la cuenta real) -- la
-# forma de simular "vender ya, al precio que sea" sin ese camino roto es un límite con margen
-# generoso sobre el precio de referencia, para que en la práctica cruce contra cualquier oferta de
-# compra razonable del momento. 2% absorbe cómodamente el atraso de ~10min de `precio` sin ser
-# "vender a cualquier precio" sin ningún piso.
+# conseguir el mejor precio. IOL no tiene un tipo "a mercado" confiable en la práctica (ver
+# comentario de arriba: `tipoOrden='precioMercado'` devolvía HTTP éxito con body vacío y cero
+# plata movida, probado contra la cuenta real) -- este buffer de 2% es la red de seguridad para
+# cuando `_iol_precio_fresco` (ver abajo) no consigue una cotización en vivo; con cotización fresca
+# el margen real usado es `_ORDEN_PRECIO_BUFFER_FRESCO_PCT`, mucho más chico.
 _ORDEN_PRECIO_BUFFER_VENTA_PCT = 2.0
+
+# Fix (27/08/2026, continuación, a pedido explícito del usuario -- "quiero que venda al precio de
+# mercado del momento, no un 2% menos"): el usuario tiene razón en el reclamo de fondo, confirmado
+# con un segundo caso real el mismo día (orden mandada a 14,77 cuando el mercado ya estaba en
+# 14,70 -- el precio de referencia usado para armar el límite venía de `indicators_intraday`, con
+# hasta ~10 min de atraso, y ya no representaba el mercado real al momento de mandar la orden).
+# `_data912_precio_fresco` (ver abajo) pide la cotización EN VIVO justo antes de armar el límite --
+# con eso el margen ya no necesita cubrir minutos de atraso, sólo asegurar que la orden cruce el
+# tick actual. 0,05% sobre px_bid/px_ask recién pedidos (no sobre un precio de minutos atrás) es
+# "vender/comprar al precio de mercado del momento" en la práctica, dentro de lo que permite el
+# hecho de que IOL no ofrezca una orden a mercado real (ver arriba). Si la cotización fresca falla
+# (red, shape inesperado, data912 caído, o el activo es venue='US' -- sólo cubre BYMA), se cae al
+# precio viejo + el buffer grande de siempre -- nunca se manda una orden sin ningún margen.
+_ORDEN_PRECIO_BUFFER_FRESCO_PCT = 0.05
+
+# data912.com/live/{arg_stocks,arg_cedears} -- la MISMA fuente pública, sin autenticación, que ya
+# usa `ingestor-byma-live` (Etapa 26, cron cada 5 min) para las velas en vivo de BYMA. Se prefiere
+# a pedir una cotización nueva a IOL porque esto ya está probado funcionando en producción (no hay
+# que verificar un endpoint/shape nuevo la próxima sesión) y da bid/ask real (`px_bid`/`px_ask`),
+# no sólo el último operado -- confirmado en vivo el 27/08/2026 (ej. BBAR: px_bid=7780,
+# px_ask=7820, distinto de c=7795). Sólo cubre activos en pesos -- para venue='US' (hoy
+# deshabilitado, `live_enabled_us=false`) no hay fuente equivalente todavía, el llamador cae al
+# precio de referencia viejo.
+_DATA912_ENDPOINTS = ('arg_stocks', 'arg_cedears')
+
+
+def _data912_precio_fresco(simbolo, lado):
+    """Precio de mercado AHORA para BYMA (`simbolo` sin sufijo '.BA', mismo formato que ya reciben
+    `_iol_comprar`/`_iol_vender`). `lado='compra'` para vender (px_bid: lo que ofrecen pagar los
+    compradores ahora mismo); `lado='venta'` para comprar (px_ask: lo que piden los vendedores).
+    Devuelve None ante cualquier problema -- red, símbolo no encontrado en ninguno de los dos
+    endpoints, campo ausente -- para que el llamador caiga al precio de referencia + buffer grande
+    de siempre en vez de romper la orden entera por esto."""
+    campo = 'px_bid' if lado == 'compra' else 'px_ask'
+    try:
+        import httpx
+        for endpoint in _DATA912_ENDPOINTS:
+            resp = httpx.get(f'https://data912.com/live/{endpoint}',
+                              headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+            if resp.status_code != 200:
+                continue
+            for row in resp.json():
+                if row.get('symbol') == simbolo:
+                    val = row.get(campo)
+                    if val is not None and float(val) > 0:
+                        return float(val)
+        return None
+    except Exception as e:
+        print(f'[data912_precio_fresco] {simbolo}: no se pudo obtener cotizacion fresca ({e}) -- '
+              f'se usa el precio de referencia anterior', flush=True)
+        return None
 
 
 def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
-    precio_limite = round(precio * (1 + _ORDEN_PRECIO_BUFFER_PCT / 100), 2)
+    fresco = _data912_precio_fresco(simbolo, 'venta') if mercado == IOL_MERCADO_ARS else None
+    if fresco is not None:
+        precio_limite = round(fresco * (1 + _ORDEN_PRECIO_BUFFER_FRESCO_PCT / 100), 2)
+    else:
+        precio_limite = round(precio * (1 + _ORDEN_PRECIO_BUFFER_PCT / 100), 2)
     return _iol_request('POST', '/api/v2/operar/Comprar', json={
         'mercado': mercado, 'simbolo': simbolo, 'precio': precio_limite, 'plazo': plazo,
         'validez': validez, 'cantidad': cantidad,
@@ -3099,7 +3152,11 @@ def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
 
 def _iol_vender(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
-    precio_limite = round(precio * (1 - _ORDEN_PRECIO_BUFFER_VENTA_PCT / 100), 2)
+    fresco = _iol_precio_fresco(mercado, simbolo, 'compra')
+    if fresco is not None:
+        precio_limite = round(fresco * (1 - _ORDEN_PRECIO_BUFFER_FRESCO_PCT / 100), 2)
+    else:
+        precio_limite = round(precio * (1 - _ORDEN_PRECIO_BUFFER_VENTA_PCT / 100), 2)
     return _iol_request('POST', '/api/v2/operar/Vender', json={
         'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad, 'precio': precio_limite,
         'validez': validez, 'plazo': plazo,
