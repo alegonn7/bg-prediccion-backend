@@ -3423,6 +3423,23 @@ def _run_motor_entradas_inner(sb, source):
         ).eq('status', 'open').eq('direction', 'up').eq('horizon_days', 1).execute().data or []
         horizon_unit = 'days'
 
+    # Fix (27/08/2026, incidente real -- 2 crasheos de worker por CRITICAL WORKER TIMEOUT en
+    # _iol_estado_cuenta a las 14:30 y 14:32, ver logs.md): `cash` se pedía UNA VEZ POR CANDIDATO
+    # adentro del loop de abajo -- con una rueda de 10+ candidatos BYMA por corrida (más aún antes
+    # del fix de decimales de más arriba, que hacía que casi todos fallaran y el ciclo completo se
+    # reintentara), eso eran 10+ llamadas reales secuenciales a IOL sólo para preguntar el mismo
+    # saldo -- que no cambia entre candidatos de la MISMA corrida (lo que sí cambia, cuánto ya se
+    # comprometió EN esta corrida, ya lo trackea `live_committed_by_venue` en memoria, más abajo).
+    # Si una sola de esas llamadas tarda (IOL lento, visto real en los logs), el tiempo se acumula
+    # candidato tras candidato hasta pasarse del timeout del worker. Se pide una sola vez acá, antes
+    # del loop, sólo para los venues habilitados en vivo -- como mucho 2 llamadas por corrida en vez
+    # de una por candidato.
+    cash_by_venue = {}
+    if cfg.get('live_enabled_byma', False):
+        cash_by_venue['BYMA'] = _iol_available_ars_cash()
+    if cfg.get('live_enabled_us', False):
+        cash_by_venue['US'] = _iol_available_usd_cash()
+
     opened, skipped_reasons, live_errors = 0, defaultdict(int), []
     for p in preds:
         if slots_left_papel <= 0 and slots_left_vivo <= 0:
@@ -3521,7 +3538,7 @@ def _run_motor_entradas_inner(sb, source):
         modo = 'papel'
         iol_buy_order_id = None
         if live_enabled:
-            cash = _iol_available_ars_cash() if venue == 'BYMA' else _iol_available_usd_cash()
+            cash = cash_by_venue.get(venue)
             if cash is None or cash <= 0:
                 skipped_reasons['vivo_sin_efectivo'] += 1
                 continue
