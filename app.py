@@ -3098,7 +3098,7 @@ def _iol_simbolo_for(ticker):
 # de fondo: el buffer existe para cubrir que `precio` (price_at_creation de la predicción) puede
 # estar minutos u horas desactualizado al momento real de la orden — la solución de fondo, pedir
 # una cotización fresca justo antes de mandar la orden en vez de confiar en un precio viejo, se
-# implementó el 27/08/2026 (ver `_iol_precio_fresco` más abajo) — este buffer de 0,1% ahora sólo
+# implementó el 27/08/2026 (ver `_data912_precio_fresco` más abajo) — este buffer de 0,1% ahora sólo
 # se usa como red de seguridad si esa cotización fresca falla.
 _ORDEN_PRECIO_BUFFER_PCT = 0.1
 
@@ -3111,7 +3111,7 @@ _ORDEN_PRECIO_BUFFER_PCT = 0.1
 # conseguir el mejor precio. IOL no tiene un tipo "a mercado" confiable en la práctica (ver
 # comentario de arriba: `tipoOrden='precioMercado'` devolvía HTTP éxito con body vacío y cero
 # plata movida, probado contra la cuenta real) -- este buffer de 2% es la red de seguridad para
-# cuando `_iol_precio_fresco` (ver abajo) no consigue una cotización en vivo; con cotización fresca
+# cuando `_data912_precio_fresco` (ver abajo) no consigue una cotización en vivo; con cotización fresca
 # el margen real usado es `_ORDEN_PRECIO_BUFFER_FRESCO_PCT`, mucho más chico.
 _ORDEN_PRECIO_BUFFER_VENTA_PCT = 2.0
 
@@ -3167,13 +3167,35 @@ def _data912_precio_fresco(simbolo, lado):
         return None
 
 
+# Fix (27/08/2026, incidente real, a pedido explícito del usuario): en la rueda de hoy casi TODAS
+# las compras reales en BYMA (METR, TGNO4, ECOG, TXAR, TRAN, BYMA, LOMA, SUPV, GGAL, PAMP, BBAR,
+# YPFD -- todo menos COME) quedaron rechazadas en bucle, cada ciclo, con "Los decimales indicados
+# no son compatibles con la alteración mínima permitida" -- el código redondeaba siempre a 2
+# decimales sin importar el precio del papel, y la grilla mínima de IOL/BYMA se hace más gruesa
+# cuanto más caro el papel (confirmado real: TXAR a $693,5 -- ya rechazado con 1 solo decimal --
+# y BBAR/YPFD en miles de pesos, todos con precio_at_creation/entry_price históricos siempre
+# enteros, nunca con decimales). Sin una tabla oficial de IOL a mano (y con el historial de este
+# archivo de adivinar mal su API, ver comentarios de _iol_request más arriba), se usa una regla
+# conservadora por banda de precio en vez de adivinar el límite exacto de cada especie: redondear
+# de más (menos decimales de los que la especie admitiría) sigue siendo un precio válido dentro de
+# esa grilla más fina, sólo menos preciso -- redondear de menos es lo que rechaza la orden. Errar
+# para el lado de menos decimales es seguro, nunca al revés. Sólo aplica a BYMA (ARS) -- los
+# activos US cotizan siempre en centavos (2 decimales) sin este problema de banda.
+def _redondear_precio_byma(precio):
+    if precio < 1:
+        return round(precio, 3)
+    if precio < 100:
+        return round(precio, 2)
+    return round(precio, 0)
+
+
 def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
-    fresco = _data912_precio_fresco(simbolo, 'venta') if mercado == IOL_MERCADO_ARS else None
-    if fresco is not None:
-        precio_limite = round(fresco * (1 + _ORDEN_PRECIO_BUFFER_FRESCO_PCT / 100), 2)
-    else:
-        precio_limite = round(precio * (1 + _ORDEN_PRECIO_BUFFER_PCT / 100), 2)
+    es_byma = mercado == IOL_MERCADO_ARS
+    fresco = _data912_precio_fresco(simbolo, 'venta') if es_byma else None
+    base = fresco * (1 + _ORDEN_PRECIO_BUFFER_FRESCO_PCT / 100) if fresco is not None \
+        else precio * (1 + _ORDEN_PRECIO_BUFFER_PCT / 100)
+    precio_limite = _redondear_precio_byma(base) if es_byma else round(base, 2)
     return _iol_request('POST', '/api/v2/operar/Comprar', json={
         'mercado': mercado, 'simbolo': simbolo, 'precio': precio_limite, 'plazo': plazo,
         'validez': validez, 'cantidad': cantidad,
@@ -3182,11 +3204,11 @@ def _iol_comprar(mercado, simbolo, precio, cantidad, plazo='t0'):
 
 def _iol_vender(mercado, simbolo, precio, cantidad, plazo='t0'):
     validez = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT23:59:59')
-    fresco = _iol_precio_fresco(mercado, simbolo, 'compra')
-    if fresco is not None:
-        precio_limite = round(fresco * (1 - _ORDEN_PRECIO_BUFFER_FRESCO_PCT / 100), 2)
-    else:
-        precio_limite = round(precio * (1 - _ORDEN_PRECIO_BUFFER_VENTA_PCT / 100), 2)
+    es_byma = mercado == IOL_MERCADO_ARS
+    fresco = _data912_precio_fresco(simbolo, 'compra') if es_byma else None
+    base = fresco * (1 - _ORDEN_PRECIO_BUFFER_FRESCO_PCT / 100) if fresco is not None \
+        else precio * (1 - _ORDEN_PRECIO_BUFFER_VENTA_PCT / 100)
+    precio_limite = _redondear_precio_byma(base) if es_byma else round(base, 2)
     return _iol_request('POST', '/api/v2/operar/Vender', json={
         'mercado': mercado, 'simbolo': simbolo, 'cantidad': cantidad, 'precio': precio_limite,
         'validez': validez, 'plazo': plazo,
